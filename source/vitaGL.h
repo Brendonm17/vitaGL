@@ -1189,6 +1189,18 @@ void vglUseExtraMem(GLboolean usage);
 // Simplified function to enable or disable V-Sync. For more fine granularity on the swap interval use eglSwapInterval.
 void vglWaitVblankStart(GLboolean enable);
 
+// Opaque handle produced by vglPrepareCompressedTexture2D. Ownership transfers to vglCommitPendingTexture or vglFreePendingTexture.
+typedef struct vglPendingTexture_s vglPendingTexture;
+
+// Allocates GPU memory and swizzles a block-compressed 2D texture. Safe to call from any thread, which lets the swizzling be performed off the rendering thread. Supported formats: GL_COMPRESSED_RGB_S3TC_DXT1_EXT, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT. Returns NULL on unsupported format or allocation failure.
+vglPendingTexture *vglPrepareCompressedTexture2D(GLenum internalformat, int width, int height, const void *data, GLsizei imageSize);
+
+// Attaches a prepared texture to the currently bound GL_TEXTURE_2D and releases the handle. Must be called from the vitaGL owning thread. Current sampler parameters set via glTexParameteri are applied to the new texture.
+void vglCommitPendingTexture(vglPendingTexture *pending);
+
+// Releases a prepared texture without binding it.
+void vglFreePendingTexture(vglPendingTexture *pending);
+
 #ifdef __cplusplus
 }
 #endif
