@@ -716,6 +716,12 @@ void glClear(GLbitfield mask) {
 
 	vglRestoreFragmentUniformBuffer();
 	vglRestoreVertexUniformBuffer();
+
+#ifdef DRAW_STATE_CACHE
+	// glClear set v/f programs via sceGxm directly; mark those caches stale.
+	extern void vgl_draw_state_cache_invalidate_programs(void);
+	vgl_draw_state_cache_invalidate_programs();
+#endif
 }
 
 void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {

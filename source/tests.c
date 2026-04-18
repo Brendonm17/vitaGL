@@ -342,6 +342,12 @@ void update_scissor_test() {
 	refresh_stencil_settings();
 
 	vglRestoreVertexUniformBuffer();
+
+#ifdef DRAW_STATE_CACHE
+	// swapped in the clear/scissor-test programs directly above.
+	extern void vgl_draw_state_cache_invalidate_programs(void);
+	vgl_draw_state_cache_invalidate_programs();
+#endif
 }
 
 void resetScissorTestRegion(void) {

@@ -24,6 +24,19 @@
 #define _GNU_SOURCE
 #include <string.h>
 #include "shared.h"
+
+// when set, _glDrawElements_CustomShadersIMPL skips the texture loops
+// and lets the caller set textures directly.
+int vgl_fast_draw_mode = 0;
+
+SceGxmContext* vglGetGxmContext(void) {
+    return gxm_context;
+}
+
+const SceGxmTexture* vglGetGxmTextureById(GLuint gl_tex_id) {
+    if (gl_tex_id == 0 || gl_tex_id >= TEXTURES_NUM) return NULL;
+    return &texture_slots[gl_tex_id].gxm_tex;
+}
 #include "utils/glsl_utils.h"
 #include "utils/shacccg_paramquery.h"
 #if defined(HAVE_SHADER_CACHE) || defined(HAVE_TEX_CACHE)
@@ -128,22 +141,190 @@ char vgl_file_cache_path[256];
 	}
 
 #ifndef HAVE_FFP_SHADER_SUPPORT
+#ifdef UNIFORM_VALUE_CACHE
+#define UNIF_CACHE_DO(p, buf, num_field, uniforms_field, last_buf_field, reserve_fn, buf_size) do { \
+	void *_new_buffer = reserve_fn(buf_size); \
+	void *_prev_buffer = p->last_buf_field; \
+	int _can_reuse = _prev_buffer && (_new_buffer > _prev_buffer); \
+	if (_can_reuse) { \
+		vgl_fast_memcpy(_new_buffer, _prev_buffer, buf_size); \
+	} \
+	for (int z = 0; z < p->num_field; z++) { \
+		uniform *u = &p->uniforms_field[z]; \
+		if (u->size > 0 && u->size < 0xFFFFFFFF) { \
+			if (!_can_reuse || !u->last_data || \
+			    __builtin_memcmp(u->data, u->last_data, u->size * sizeof(float)) != 0) { \
+				sceGxmSetUniformDataF(_new_buffer, u->ptr, 0, u->size, u->data); \
+				if (u->last_data) __builtin_memcpy(u->last_data, u->data, u->size * sizeof(float)); \
+			} \
+		} \
+	} \
+	p->last_buf_field = _new_buffer; \
+} while (0)
+
 #define uploadUniforms() \
 	if (p->vert_uniforms && dirty_vert_unifs) { \
-		void *buffer = vglReserveVertexUniformBuffer(p->vshader->unif_buf_size); \
-		for (int z = 0; z < p->vert_uniforms_num; z++) { \
-			uniform *u = &p->vert_uniforms[z]; \
-			if (u->size > 0 && u->size < 0xFFFFFFFF) \
-				sceGxmSetUniformDataF(buffer, u->ptr, 0, u->size, u->data); \
+		UNIF_CACHE_DO(p, buffer, vert_uniforms_num, vert_uniforms, last_vert_buf, vglReserveVertexUniformBuffer, p->vshader->unif_buf_size); \
+		dirty_vert_unifs = GL_FALSE; \
+	} \
+	if (p->frag_uniforms && dirty_frag_unifs) { \
+		UNIF_CACHE_DO(p, buffer, frag_uniforms_num, frag_uniforms, last_frag_buf, vglReserveFragmentUniformBuffer, p->fshader->unif_buf_size); \
+		dirty_frag_unifs = GL_FALSE; \
+	} \
+	if (p->vert_ubos) { \
+		ubo *u = p->vert_ubos; \
+		while (u) { \
+			ubo *b = u->alias ? u->alias : u; \
+			sceGxmSetVertexUniformBuffer(gxm_context, b->idx, (uint8_t *)ubo_buf[b->bind]->ptr + ubo_offset[b->bind]); \
+			ubo_buf[b->bind]->last_frame = vgl_framecount; \
+			u = (ubo *)u->chain; \
+		} \
+	} \
+	if (p->frag_ubos) { \
+		ubo *u = p->frag_ubos; \
+		while (u) { \
+			sceGxmSetFragmentUniformBuffer(gxm_context, u->idx, (uint8_t *)ubo_buf[u->bind]->ptr + ubo_offset[u->bind]); \
+			ubo_buf[u->bind]->last_frame = vgl_framecount; \
+			u = (ubo *)u->chain; \
+		} \
+	}
+#else
+#define _VGL_PROBE_OFFSETS(unis, num, buf_size, out_offsets) do { \
+	(out_offsets) = (int32_t *)malloc((num) * sizeof(int32_t)); \
+	uint8_t *_probe = (uint8_t *)calloc(1, buf_size); \
+	const float _marker = 1.0f; \
+	uint32_t _mbits; __builtin_memcpy(&_mbits, &_marker, 4); \
+	for (uint32_t _z = 0; _z < (num); _z++) { \
+		if ((unis)[_z].size <= 0 || (unis)[_z].size >= 0xFFFFFFFF) \
+			{ (out_offsets)[_z] = -1; continue; } \
+		memset(_probe, 0, buf_size); \
+		sceGxmSetUniformDataF(_probe, (unis)[_z].ptr, 0, 1, &_marker); \
+		int32_t _found = -1; \
+		for (uint32_t _b = 0; _b + 3 < (buf_size); _b += 4) { \
+			uint32_t _val; __builtin_memcpy(&_val, _probe + _b, 4); \
+			if (_val == _mbits) { _found = (int32_t)_b; break; } \
+		} \
+		(out_offsets)[_z] = _found; \
+	} \
+	free(_probe); \
+} while(0)
+
+#define _VGL_REDIRECT_AND_BUILD_FIXUP(unis, num, shadow, offsets, fixup_list, fixup_meta, fixup_count, used_bytes, buf_size) do { \
+	(fixup_list) = (uint16_t *)malloc((num) * sizeof(uint16_t)); \
+	(fixup_meta) = (struct vgl_fixup_meta_s *)malloc((num) * sizeof(struct vgl_fixup_meta_s)); \
+	(fixup_count) = 0; \
+	uint32_t _max_end = 0; \
+	uint8_t *_probe2 = NULL; \
+	const float _fmarker = 1.0f; \
+	uint32_t _fmbits; __builtin_memcpy(&_fmbits, &_fmarker, 4); \
+	for (uint32_t _z = 0; _z < (num); _z++) { \
+		int32_t _off = (offsets)[_z]; \
+		if (_off < 0) { \
+			if ((unis)[_z].size > 0 && (unis)[_z].size < 0xFFFFFFFF) { \
+				(fixup_list)[(fixup_count)] = (uint16_t)_z; \
+				(fixup_meta)[(fixup_count)].stride = 0; \
+				(fixup_meta)[(fixup_count)].ccbytes = 0; \
+				(fixup_meta)[(fixup_count)].arr = 0; \
+				(fixup_count)++; \
+			} \
+			continue; \
+		} \
+		uint32_t _end = (uint32_t)_off + (unis)[_z].size * sizeof(float); \
+		if (_end > _max_end) _max_end = _end; \
+		uint32_t _cc = sceGxmProgramParameterGetComponentCount((unis)[_z].ptr); \
+		uint32_t _arr = sceGxmProgramParameterGetArraySize((unis)[_z].ptr); \
+		if (_arr <= 1 || _cc == 4 || _cc == 1) { \
+			float *_old = (unis)[_z].data; \
+			float *_new = (float*)((uint8_t*)(shadow) + _off); \
+			__builtin_memcpy(_new, _old, (unis)[_z].size * sizeof(float)); \
+			vgl_free(_old); \
+			(unis)[_z].data = _new; \
+		} else { \
+			/* scan starts at _off+4 to skip stray zeros in elem 0. */ \
+			uint32_t _stride = 0; \
+			if (!_probe2) _probe2 = (uint8_t *)calloc(1, (buf_size)); \
+			memset(_probe2, 0, (buf_size)); \
+			sceGxmSetUniformDataF(_probe2, (unis)[_z].ptr, _cc, 1, &_fmarker); \
+			for (uint32_t _b = (uint32_t)_off + 4; _b + 3 < (buf_size); _b += 4) { \
+				uint32_t _v; __builtin_memcpy(&_v, _probe2 + _b, 4); \
+				if (_v == _fmbits) { \
+					_stride = _b - (uint32_t)_off; \
+					break; \
+				} \
+			} \
+			(fixup_list)[(fixup_count)] = (uint16_t)_z; \
+			(fixup_meta)[(fixup_count)].stride = (uint16_t)_stride; \
+			(fixup_meta)[(fixup_count)].ccbytes = (uint16_t)(_cc * sizeof(float)); \
+			(fixup_meta)[(fixup_count)].arr = (uint16_t)_arr; \
+			(fixup_count)++; \
+			uint32_t _cc_end = (_stride > 0) ? ((uint32_t)_off + _arr * _stride) \
+			                                 : ((uint32_t)_off + _arr * ((_cc * sizeof(float) + 7u) & ~7u)); \
+			if (_cc_end > _max_end) _max_end = _cc_end; \
+		} \
+	} \
+	if (_probe2) free(_probe2); \
+	(used_bytes) = _max_end; \
+} while(0)
+
+#define _FAST_UPLOAD_UNIFORMS(unis, shadow, offsets, fixup_list, fixup_meta, fixup_count, buf_size, reserve_fn) \
+	do { \
+		void *buffer = reserve_fn(buf_size); \
+		__builtin_memcpy(buffer, shadow, buf_size); \
+		for (uint32_t _f = 0; _f < (fixup_count); _f++) { \
+			uniform *_u = &(unis)[(fixup_list)[_f]]; \
+			sceGxmSetUniformDataF(buffer, _u->ptr, 0, _u->size, _u->data); \
+		} \
+		(void)(fixup_meta); (void)(offsets); \
+	} while(0)
+
+#define uploadUniforms() \
+	if (p->vert_uniforms && dirty_vert_unifs) { \
+		if (vgl_fast_draw_mode && p->vert_uniforms_num > 0) { \
+			if (!p->vert_uniform_offsets) { \
+				_VGL_PROBE_OFFSETS(p->vert_uniforms, p->vert_uniforms_num, \
+					p->vshader->unif_buf_size, p->vert_uniform_offsets); \
+				p->vert_shadow = calloc(1, p->vshader->unif_buf_size); \
+				_VGL_REDIRECT_AND_BUILD_FIXUP(p->vert_uniforms, p->vert_uniforms_num, \
+					p->vert_shadow, p->vert_uniform_offsets, \
+					p->vert_fixup_list, p->vert_fixup_meta, p->vert_fixup_count, p->vert_shadow_used, \
+					p->vshader->unif_buf_size); \
+			} \
+			_FAST_UPLOAD_UNIFORMS(p->vert_uniforms, \
+				p->vert_shadow, p->vert_uniform_offsets, \
+				p->vert_fixup_list, p->vert_fixup_meta, p->vert_fixup_count, \
+				p->vshader->unif_buf_size, vglReserveVertexUniformBuffer); \
+		} else { \
+			void *buffer = vglReserveVertexUniformBuffer(p->vshader->unif_buf_size); \
+			for (int z = 0; z < p->vert_uniforms_num; z++) { \
+				uniform *u = &p->vert_uniforms[z]; \
+				if (u->size > 0 && u->size < 0xFFFFFFFF) \
+					sceGxmSetUniformDataF(buffer, u->ptr, 0, u->size, u->data); \
+			} \
 		} \
 		dirty_vert_unifs = GL_FALSE; \
 	} \
 	if (p->frag_uniforms && dirty_frag_unifs) { \
-		void *buffer = vglReserveFragmentUniformBuffer(p->fshader->unif_buf_size); \
-		for (int z = 0; z < p->frag_uniforms_num; z++) { \
-			uniform *u = &p->frag_uniforms[z]; \
-			if (u->size > 0 && u->size < 0xFFFFFFFF) \
-				sceGxmSetUniformDataF(buffer, u->ptr, 0, u->size, u->data); \
+		if (vgl_fast_draw_mode && p->frag_uniforms_num > 0) { \
+			if (!p->frag_uniform_offsets) { \
+				_VGL_PROBE_OFFSETS(p->frag_uniforms, p->frag_uniforms_num, \
+					p->fshader->unif_buf_size, p->frag_uniform_offsets); \
+				p->frag_shadow = calloc(1, p->fshader->unif_buf_size); \
+				_VGL_REDIRECT_AND_BUILD_FIXUP(p->frag_uniforms, p->frag_uniforms_num, \
+					p->frag_shadow, p->frag_uniform_offsets, \
+					p->frag_fixup_list, p->frag_fixup_meta, p->frag_fixup_count, p->frag_shadow_used, \
+					p->fshader->unif_buf_size); \
+			} \
+			_FAST_UPLOAD_UNIFORMS(p->frag_uniforms, \
+				p->frag_shadow, p->frag_uniform_offsets, \
+				p->frag_fixup_list, p->frag_fixup_meta, p->frag_fixup_count, \
+				p->fshader->unif_buf_size, vglReserveFragmentUniformBuffer); \
+		} else { \
+			void *buffer = vglReserveFragmentUniformBuffer(p->fshader->unif_buf_size); \
+			for (int z = 0; z < p->frag_uniforms_num; z++) { \
+				uniform *u = &p->frag_uniforms[z]; \
+				if (u->size > 0 && u->size < 0xFFFFFFFF) \
+					sceGxmSetUniformDataF(buffer, u->ptr, 0, u->size, u->data); \
+			} \
 		} \
 		dirty_frag_unifs = GL_FALSE; \
 	} \
@@ -164,6 +345,7 @@ char vgl_file_cache_path[256];
 			u = (ubo *)u->chain; \
 		} \
 	}
+#endif // UNIFORM_VALUE_CACHE
 #else
 #define uploadUniforms() \
 	if (p->vert_uniforms && dirty_vert_unifs) { \
@@ -230,7 +412,7 @@ char vgl_file_cache_path[256];
 		p->blend_info.raw = blend_info.raw; \
 		rebuild_frag_shader(p->fshader->id, &p->fprog, (SceGxmProgram *)p->vshader->prog, is_fbo_float ? SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4); \
 	} \
-	sceGxmSetFragmentProgram(gxm_context, p->fprog);
+	VGL_SET_FPROG(p->fprog);
 	
 #define alignAttributes(attributes, streams) \
 	if (p->has_unaligned_attrs) { \
@@ -266,6 +448,102 @@ static unsigned char orig_size[VERTEX_ATTRIBS_NUM];
 static gpubuffer *ubo_buf[UBOS_NUM];
 static uint32_t ubo_offset[UBOS_NUM];
 static uint8_t tex2d_override = 0;
+
+#ifdef DRAW_PHASE_PROFILING
+static uint32_t phase_counters[6] = {0};
+#define PHASE_FRAG_TEX    0
+#define PHASE_VERT_TEX    1
+#define PHASE_ALIGN_ATTRS 2
+#define PHASE_PATCH_VPROG 3
+#define PHASE_UPLOAD_UNIF 4
+#define PHASE_VSTREAMS    5
+
+#define PHASE_BEGIN(idx) uint32_t __ph_##idx = sceKernelGetProcessTimeLow()
+#define PHASE_END(idx)   phase_counters[PHASE_##idx] += sceKernelGetProcessTimeLow() - __ph_##idx
+
+void vgl_reset_draw_phases(void) {
+    for (int i = 0; i < 6; i++) phase_counters[i] = 0;
+}
+
+void vgl_get_draw_phases(unsigned int out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = phase_counters[i];
+}
+#else
+#define PHASE_BEGIN(idx) ((void)0)
+#define PHASE_END(idx)   ((void)0)
+
+void vgl_reset_draw_phases(void) {}
+
+void vgl_get_draw_phases(unsigned int out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = 0;
+}
+#endif
+
+#ifdef DRAW_STATE_CACHE
+static const SceGxmTexture *last_frag_tex_cache[16];
+static const SceGxmTexture *last_vert_tex_cache[16];
+static const void *last_vstream_cache[VERTEX_ATTRIBS_NUM];
+static SceGxmVertexProgram *last_vprog_cache;
+static SceGxmFragmentProgram *last_fprog_cache;
+
+void vgl_draw_state_cache_reset(void) {
+    for (int i = 0; i < 16; i++) { last_frag_tex_cache[i] = NULL; last_vert_tex_cache[i] = NULL; }
+    for (int i = 0; i < VERTEX_ATTRIBS_NUM; i++) last_vstream_cache[i] = NULL;
+    last_vprog_cache = NULL;
+    last_fprog_cache = NULL;
+}
+
+// for callers that set v/f programs directly (glClear, scissor test);
+// leaves the texture and vstream caches alone.
+void vgl_draw_state_cache_invalidate_programs(void) {
+    last_vprog_cache = NULL;
+    last_fprog_cache = NULL;
+}
+
+#define VGL_SET_FRAG_TEX(unit, tex) do { \
+    if (last_frag_tex_cache[(unit)] != (tex)) { \
+        sceGxmSetFragmentTexture(gxm_context, (unit), (tex)); \
+        last_frag_tex_cache[(unit)] = (tex); \
+    } \
+} while (0)
+
+#define VGL_SET_VERT_TEX(unit, tex) do { \
+    if (last_vert_tex_cache[(unit)] != (tex)) { \
+        sceGxmSetVertexTexture(gxm_context, (unit), (tex)); \
+        last_vert_tex_cache[(unit)] = (tex); \
+    } \
+} while (0)
+
+#define VGL_SET_VSTREAM(idx, ptr) do { \
+    if (last_vstream_cache[(idx)] != (const void *)(ptr)) { \
+        sceGxmSetVertexStream(gxm_context, (idx), (ptr)); \
+        last_vstream_cache[(idx)] = (const void *)(ptr); \
+    } \
+} while (0)
+
+#define VGL_SET_VPROG(prog) do { \
+    if (last_vprog_cache != (prog)) { \
+        sceGxmSetVertexProgram(gxm_context, (prog)); \
+        last_vprog_cache = (prog); \
+    } \
+} while (0)
+
+#define VGL_SET_FPROG(prog) do { \
+    if (last_fprog_cache != (prog)) { \
+        sceGxmSetFragmentProgram(gxm_context, (prog)); \
+        last_fprog_cache = (prog); \
+    } \
+} while (0)
+
+#else // !DRAW_STATE_CACHE
+
+#define VGL_SET_FRAG_TEX(unit, tex)  sceGxmSetFragmentTexture(gxm_context, (unit), (tex))
+#define VGL_SET_VERT_TEX(unit, tex)  sceGxmSetVertexTexture(gxm_context, (unit), (tex))
+#define VGL_SET_VSTREAM(idx, ptr)    sceGxmSetVertexStream(gxm_context, (idx), (ptr))
+#define VGL_SET_VPROG(prog)          sceGxmSetVertexProgram(gxm_context, (prog))
+#define VGL_SET_FPROG(prog)          sceGxmSetFragmentProgram(gxm_context, (prog))
+
+#endif // DRAW_STATE_CACHE
 
 #ifdef HAVE_GLSL_TRANSLATOR
 typedef struct {
@@ -305,6 +583,9 @@ typedef struct {
 #endif
 	GLboolean is_fragment;
 	GLboolean is_vertex;
+#ifdef UNIFORM_VALUE_CACHE
+	float *last_data;
+#endif
 } uniform;
 
 // Program status enum
@@ -363,9 +644,30 @@ typedef struct {
 	GLuint attr_highest_idx;
 	GLboolean has_unaligned_attrs;
 	GLboolean is_fbo_float;
+	int32_t *vert_uniform_offsets;
+	int32_t *frag_uniform_offsets;
+	void *vert_shadow;
+	void *frag_shadow;
+	uint16_t *vert_fixup_list;
+	uint16_t *frag_fixup_list;
+	uint16_t vert_fixup_count;
+	uint16_t frag_fixup_count;
+	struct vgl_fixup_meta_s {
+		uint16_t stride;
+		uint16_t ccbytes;
+		uint16_t arr;
+		uint16_t _pad;
+	} *vert_fixup_meta;
+	struct vgl_fixup_meta_s *frag_fixup_meta;
+	uint32_t vert_shadow_used;
+	uint32_t frag_shadow_used;
 #ifdef HAVE_GLSL_TRANSLATOR
 	uint8_t num_glsl_attr;
 	attr_mapping *glsl_attr_map;
+#endif
+#ifdef UNIFORM_VALUE_CACHE
+	void *last_vert_buf;
+	void *last_frag_buf;
 #endif
 } program;
 
@@ -375,6 +677,16 @@ static program progs[MAX_CUSTOM_PROGRAMS];
 
 #ifdef HAVE_SHARK_LOG
 static char *shark_log = NULL;
+#endif
+
+#ifdef UNIFORM_VALUE_CACHE
+// called from vglSwapBuffers since the circular pool recycles per frame.
+void vgl_uniform_cache_reset(void) {
+	for (int i = 0; i < MAX_CUSTOM_PROGRAMS; i++) {
+		progs[i].last_vert_buf = NULL;
+		progs[i].last_frag_buf = NULL;
+	}
+}
 #endif
 
 #ifdef STRICT_UNIFORMS_COMPLIANCE
@@ -739,7 +1051,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_FRAG_TEX(i, &tex->gxm_tex);
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
 			if (info) {
@@ -789,7 +1101,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 				vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetVertexTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_VERT_TEX(i, &tex->gxm_tex);
 #ifndef SAMPLERS_SPEEDHACK
 		}
 #endif
@@ -873,7 +1185,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 
 	// Uploading new vertex program
 	patchVertexProgram(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
-	sceGxmSetVertexProgram(gxm_context, p->vprog);
+	VGL_SET_VPROG(p->vprog);
 
 	// Uploading both fragment and vertex uniforms data
 	uploadUniforms();
@@ -886,14 +1198,14 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 			if (is_active) {
 #ifdef STRICT_DRAW_COMPLIANCE
 				if (is_packed[i])
-					sceGxmSetVertexStream(gxm_context, i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
+					VGL_SET_VSTREAM(i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
 				else
-					sceGxmSetVertexStream(gxm_context, i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
+					VGL_SET_VSTREAM(i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
 #else
 				if (is_packed)
-					sceGxmSetVertexStream(gxm_context, i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
+					VGL_SET_VSTREAM(i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
 				else
-					sceGxmSetVertexStream(gxm_context, i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
+					VGL_SET_VSTREAM(i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
 #endif
 			}
 		}
@@ -956,7 +1268,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_FRAG_TEX(i, &tex->gxm_tex);
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
 			if (info) {
@@ -1006,7 +1318,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 				vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetVertexTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_VERT_TEX(i, &tex->gxm_tex);
 #ifndef SAMPLERS_SPEEDHACK
 		}
 #endif
@@ -1114,7 +1426,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 
 	// Uploading new vertex program
 	patchVertexProgram(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
-	sceGxmSetVertexProgram(gxm_context, p->vprog);
+	VGL_SET_VPROG(p->vprog);
 
 	// Uploading both fragment and vertex uniforms data
 	uploadUniforms();
@@ -1125,16 +1437,16 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 		GLboolean is_active = (cur_vao->vertex_attrib_state & (1 << attr_idx)) ? GL_TRUE : GL_FALSE;
 		if (is_active) {
 #ifdef DRAW_SPEEDHACK
-			sceGxmSetVertexStream(gxm_context, i, ptrs[i]);
+			VGL_SET_VSTREAM(i, ptrs[i]);
 #else
 #ifdef STRICT_DRAW_COMPLIANCE
-			sceGxmSetVertexStream(gxm_context, i, is_packed[i] ? ptrs[0] : ptrs[i]);
+			VGL_SET_VSTREAM(i, is_packed[i] ? ptrs[0] : ptrs[i]);
 #else
-			sceGxmSetVertexStream(gxm_context, i, is_packed ? ptrs[0] : ptrs[i]);
+			VGL_SET_VSTREAM(i, is_packed ? ptrs[0] : ptrs[i]);
 #endif
 #endif
 		} else {
-			sceGxmSetVertexStream(gxm_context, i, cur_vao->vertex_attrib_value[attr_idx]);
+			VGL_SET_VSTREAM(i, cur_vao->vertex_attrib_value[attr_idx]);
 		}
 		if (!p->has_unaligned_attrs) {
 			attributes[i].regIndex = i;
@@ -1161,7 +1473,9 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 	// Check if a blend info rebuild is required and upload fragment program
 	setupFragProgram();
 
-	// Uploading fragment textures on relative texture units
+	// (skipped in vgl_fast_draw_mode; caller sets textures directly.)
+	PHASE_BEGIN(FRAG_TEX);
+	if (!vgl_fast_draw_mode)
 	for (int i = 0; i < p->max_frag_texunit_idx; i++) {
 #ifndef SAMPLERS_SPEEDHACK
 		if (p->frag_texunits[i]) {
@@ -1202,7 +1516,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_FRAG_TEX(i, &tex->gxm_tex);
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
 			if (info) {
@@ -1215,8 +1529,12 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 		}
 #endif
 	}
+	PHASE_END(FRAG_TEX);
 
 	// Uploading vertex textures on relative texture units
+	// (skipped in vgl_fast_draw_mode; caller handles any vertex textures.)
+	PHASE_BEGIN(VERT_TEX);
+	if (!vgl_fast_draw_mode)
 	for (int i = 0; i < p->max_vert_texunit_idx; i++) {
 #ifndef SAMPLERS_SPEEDHACK
 		if (p->vert_texunits[i]) {
@@ -1252,13 +1570,28 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 				vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetVertexTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_VERT_TEX(i, &tex->gxm_tex);
 #ifndef SAMPLERS_SPEEDHACK
 		}
 #endif
 	}
+	PHASE_END(VERT_TEX);
+
+	// same-shader fast path: vprog/attribs/vstreams persist from the
+	// previous draw, jump straight to uniform upload.
+	if (vgl_fast_draw_mode) {
+		static GLuint _last_fast_prog = 0;
+		if (cur_program == _last_fast_prog) {
+			PHASE_BEGIN(UPLOAD_UNIF);
+			uploadUniforms();
+			PHASE_END(UPLOAD_UNIF);
+			return GL_TRUE;
+		}
+		_last_fast_prog = cur_program;
+	}
 
 	// Aligning attributes
+	PHASE_BEGIN(ALIGN_ATTRS);
 	SceGxmVertexAttribute *attributes;
 	SceGxmVertexStream *streams;
 	alignAttributes(attributes, streams);
@@ -1378,37 +1711,43 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 		for (int i = 0; i < p->attr_num; i++) {
 			uint8_t attr_idx = p->attr_map[i];
 			streams[i].indexSource = (cur_vao->vertex_attrib_divisor & (1 << attr_idx)) ? index_type : (index_type & 1);
-		}		
+		}
 	} else {
 		for (int i = 0; i < p->attr_num; i++) {
 			streams[i].indexSource = index_type;
 		}
 	}
 #endif
+	PHASE_END(ALIGN_ATTRS);
 
 	// Uploading new vertex program
+	PHASE_BEGIN(PATCH_VPROG);
 	patchVertexProgram(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
-	sceGxmSetVertexProgram(gxm_context, p->vprog);
+	VGL_SET_VPROG(p->vprog);
+	PHASE_END(PATCH_VPROG);
 
 	// Uploading both fragment and vertex uniforms data
+	PHASE_BEGIN(UPLOAD_UNIF);
 	uploadUniforms();
+	PHASE_END(UPLOAD_UNIF);
 
 	// Uploading vertex streams
+	PHASE_BEGIN(VSTREAMS);
 	for (int i = 0; i < p->attr_num; i++) {
 		uint8_t attr_idx = p->attr_map[i];
 		GLboolean is_active = (cur_vao->vertex_attrib_state & (1 << attr_idx)) ? GL_TRUE : GL_FALSE;
 		if (is_active) {
 #ifdef DRAW_SPEEDHACK
-			sceGxmSetVertexStream(gxm_context, i, ptrs[i]);
+			VGL_SET_VSTREAM(i, ptrs[i]);
 #else
 #ifdef STRICT_DRAW_COMPLIANCE
-			sceGxmSetVertexStream(gxm_context, i, is_packed[i] ? ptrs[0] : ptrs[i]);
+			VGL_SET_VSTREAM(i, is_packed[i] ? ptrs[0] : ptrs[i]);
 #else
-			sceGxmSetVertexStream(gxm_context, i, is_packed ? ptrs[0] : ptrs[i]);
+			VGL_SET_VSTREAM(i, is_packed ? ptrs[0] : ptrs[i]);
 #endif
 #endif
 		} else {
-			sceGxmSetVertexStream(gxm_context, i, cur_vao->vertex_attrib_value[attr_idx]);
+			VGL_SET_VSTREAM(i, cur_vao->vertex_attrib_value[attr_idx]);
 		}
 		if (!p->has_unaligned_attrs) {
 			attributes[i].regIndex = i;
@@ -1419,6 +1758,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 			}
 		}
 	}
+	PHASE_END(VSTREAMS);
 #ifdef HAVE_PROFILING
 	shaders_draw_profiler_cnt += sceKernelGetProcessTimeLow() - draw_start;
 	shaders_draw_cnt++;
@@ -1437,7 +1777,7 @@ void _vglDrawObjects_CustomShadersIMPL(GLboolean implicit_wvp) {
 	setupFragProgram();
 
 	// Setting up required vertex shader
-	sceGxmSetVertexProgram(gxm_context, p->vprog);
+	VGL_SET_VPROG(p->vprog);
 
 	// Uploading both fragment and vertex uniforms data
 	uploadUniforms();
@@ -1451,7 +1791,7 @@ void _vglDrawObjects_CustomShadersIMPL(GLboolean implicit_wvp) {
 #ifndef TEXTURES_SPEEDHACK
 			tex->last_frame = vgl_framecount;
 #endif
-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_FRAG_TEX(i, &tex->gxm_tex);
 #ifndef SAMPLERS_SPEEDHACK
 		}
 #endif
@@ -1864,6 +2204,22 @@ GLuint glCreateProgram(void) {
 			progs[i].frag_uniforms_num = 0;
 			progs[i].vert_ubos = NULL;
 			progs[i].frag_ubos = NULL;
+			progs[i].vert_uniform_offsets = NULL;
+			progs[i].frag_uniform_offsets = NULL;
+			progs[i].vert_shadow = NULL;
+			progs[i].frag_shadow = NULL;
+			progs[i].vert_fixup_list = NULL;
+			progs[i].frag_fixup_list = NULL;
+			progs[i].vert_fixup_count = 0;
+			progs[i].frag_fixup_count = 0;
+			progs[i].vert_fixup_meta = NULL;
+			progs[i].frag_fixup_meta = NULL;
+			progs[i].vert_shadow_used = 0;
+			progs[i].frag_shadow_used = 0;
+#ifdef UNIFORM_VALUE_CACHE
+			progs[i].last_vert_buf = NULL;
+			progs[i].last_frag_buf = NULL;
+#endif
 			progs[i].attr_highest_idx = 0;
 #ifdef HAVE_GLSL_TRANSLATOR
 			progs[i].num_glsl_attr = 0;
@@ -1969,6 +2325,9 @@ void glDeleteProgram(GLuint prog) {
 			uniform *u = &p->vert_uniforms[i];
 			if (u->size != 0xFFFFFFFF && u->size != 0 && !(u->is_fragment && u->is_vertex))
 				vgl_free(u->data);
+#ifdef UNIFORM_VALUE_CACHE
+			if (u->last_data) vgl_free(u->last_data);
+#endif
 		}
 		vgl_free(p->vert_uniforms);
 		for (int i = 0; i < p->frag_uniforms_num; i++) {
@@ -1979,6 +2338,9 @@ void glDeleteProgram(GLuint prog) {
 			if (u->size != 0xFFFFFFFF && u->size != 0)
 #endif
 				vgl_free(u->data);
+#ifdef UNIFORM_VALUE_CACHE
+			if (u->last_data) vgl_free(u->last_data);
+#endif
 		}
 		vgl_free(p->frag_uniforms);
 		while (p->vert_ubos) {
@@ -2243,6 +2605,10 @@ void glLinkProgram(GLuint progr) {
 			u->is_fragment = GL_TRUE;
 			u->size = sceGxmProgramParameterGetComponentCount(param) * sceGxmProgramParameterGetArraySize(param);
 			u->data = (float *)vglMalloc(u->size * sizeof(float));
+#ifdef UNIFORM_VALUE_CACHE
+			u->last_data = NULL; // set below if path doesn't reassign u->data
+			int _use_owned_data = 1;
+#endif
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 			u->sampler = NULL;
 			const char *pname = sceGxmProgramParameterGetName(param);
@@ -2253,15 +2619,25 @@ void glLinkProgram(GLuint progr) {
 					u->sampler = &p->fshader->sized_samplers[i];
 					vgl_free(u->data);
 					u->data = p->fshader->sized_samplers[i].sizes;
+#ifdef UNIFORM_VALUE_CACHE
+					_use_owned_data = 0;
+#endif
 					break;
 				}
 			}
 #endif
 			vgl_memset(u->data, 0, u->size * sizeof(float));
+#ifdef UNIFORM_VALUE_CACHE
+			// 0xFF so the first memcmp vs data (0-init) mismatches.
+			if (_use_owned_data) {
+				u->last_data = (float *)vglMalloc(u->size * sizeof(float));
+				vgl_memset(u->last_data, 0xFF, u->size * sizeof(float));
+			}
+#endif
 		}
 		ptr += 4;
 	}
-	
+
 
 	// Analyzing vertex shader
 #ifdef HAVE_FFP_SHADER_SUPPORT
@@ -2305,6 +2681,9 @@ void glLinkProgram(GLuint progr) {
 			u->ptr = param;
 			u->size = sceGxmProgramParameterIsSamplerCube(param) ? 0xFFFFFFFF : 0;
 			u->data = NULL;
+#ifdef UNIFORM_VALUE_CACHE
+			u->last_data = NULL;
+#endif
 			p->vert_texunits[texunit_idx - 1] = u;
 		} else if (cat == SCE_GXM_PARAMETER_CATEGORY_UNIFORM && sceGxmProgramParameterGetContainerIndex(param) == UBOS_NUM) {
 			uniform *u = &p->vert_uniforms[j++];
@@ -2314,10 +2693,17 @@ void glLinkProgram(GLuint progr) {
 			u->data = getUniformAliasDataPtr(p->frag_uniforms, p->frag_uniforms_num, sceGxmProgramParameterGetName(param), u->size);
 			if (u->data) {
 				u->is_fragment = GL_TRUE;
+#ifdef UNIFORM_VALUE_CACHE
+				u->last_data = NULL;
+#endif
 			} else {
 				u->is_fragment = GL_FALSE;
 				u->data = (float *)vglMalloc(u->size * sizeof(float));
 				vgl_memset(u->data, 0, u->size * sizeof(float));
+#ifdef UNIFORM_VALUE_CACHE
+				u->last_data = (float *)vglMalloc(u->size * sizeof(float));
+				vgl_memset(u->last_data, 0xFF, u->size * sizeof(float));
+#endif
 			}
 		}
 		ptr += 4;

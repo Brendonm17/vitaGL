@@ -1201,6 +1201,34 @@ void vglCommitPendingTexture(vglPendingTexture *pending);
 // Releases a prepared texture without binding it.
 void vglFreePendingTexture(vglPendingTexture *pending);
 
+// Resets the per-phase draw timing counters. Only functional when vitaGL is
+// built with DRAW_PHASE_PROFILING=1, otherwise a no-op. Call once per frame
+// before draw submission, then read back with vgl_get_draw_phases.
+void vgl_reset_draw_phases(void);
+
+// Reads the accumulated per-phase draw times (microseconds) into out[6].
+// Indices: 0=frag_tex, 1=vert_tex, 2=align_attrs, 3=patch_vprog,
+// 4=upload_unif, 5=vstreams. Only functional when vitaGL is built with
+// DRAW_PHASE_PROFILING=1, otherwise zeros are written.
+void vgl_get_draw_phases(unsigned int out[6]);
+
+// GXM fast-path: bypass VitaGL's per-draw texture/attribute/stream
+// overhead. caller sets textures and streams via sceGxm directly,
+// VitaGL only handles fragment program (blend), vertex program
+// (patch), uniform upload, and the draw command.
+//
+// Usage:
+//   ctx = vglGetGxmContext();
+//   vgl_fast_draw_mode = 1;
+//   // per texture change:
+//   sceGxmSetFragmentTexture(ctx, unit, vglGetGxmTextureById(gl_id));
+//   // per draw:
+//   glDrawElements(mode, count, type, indices);  // skips tex loops
+//   vgl_fast_draw_mode = 0;
+extern int vgl_fast_draw_mode;
+SceGxmContext* vglGetGxmContext(void);
+const SceGxmTexture* vglGetGxmTextureById(GLuint gl_tex_id);
+
 #ifdef __cplusplus
 }
 #endif
