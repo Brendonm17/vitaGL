@@ -78,13 +78,17 @@
 #define SAFE_DRAW_SIZE_THRESHOLD (0x8000) // Minimum bytes of vertices data for a draw to be handled with speedhack
 #endif
 
-#ifdef HAVE_FAILSAFE_CIRCULAR_VERTEX_POOL
-#define CIRCULAR_VERTEX_POOLS_NUM 3
-extern uint8_t *vertex_data_pool[CIRCULAR_VERTEX_POOLS_NUM];
-extern uint8_t *vertex_data_pool_ptr[CIRCULAR_VERTEX_POOLS_NUM];
+#if !defined(DISABLE_CIRCULAR_POOL) && !defined(CIRCULAR_POOL_SPEEDHACK)
+extern uint8_t *circular_data_pool[DISPLAY_MAX_BUFFER_COUNT];
+extern uint8_t *circular_data_pool_ptr[DISPLAY_MAX_BUFFER_COUNT];
 extern int vgl_circular_idx;
+#ifdef HAVE_DEBUG_INTERFACE
+extern uint32_t vgl_circular_pool_frame_peak;
+extern uint32_t vgl_circular_pool_global_peak;
+extern uint32_t circular_data_pool_size;
 #endif
-#if defined(HAVE_SCRATCH_MEMORY) && defined(HAVE_CIRCULAR_VERTEX_POOL)
+#endif
+#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
 extern GLboolean vgl_dynamic_wants_scratch;
 extern GLboolean vgl_stream_wants_scratch;
 #endif
@@ -565,7 +569,7 @@ typedef struct {
 	int32_t size;
 	vglMemType type;
 	uint32_t last_frame;
-#if defined(HAVE_SCRATCH_MEMORY) && defined(HAVE_CIRCULAR_VERTEX_POOL)
+#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
 	GLboolean scratch;
 #endif
 	GLboolean mapped;
@@ -686,7 +690,6 @@ typedef struct {
 	void *chain;
 } block_uniform;
 
-#ifdef HAVE_GLSL_TRANSLATOR
 #define MAX_CG_TEXCOORD_ID 10 // Maximum number of bindable TEXCOORD semantic
 #define MAX_CG_COLOR_ID 2 // Maximum number of bindable COLOR semantic
 typedef struct {
@@ -695,7 +698,6 @@ typedef struct {
 	GLboolean texcoord_used[MAX_CG_TEXCOORD_ID];
 	GLboolean color_used[MAX_CG_COLOR_ID];
 } binds_map;
-#endif
 
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 typedef struct {
@@ -709,13 +711,11 @@ typedef struct {
 	GLenum type;
 	GLboolean valid;
 	GLboolean dirty;
-#ifdef HAVE_GLSL_TRANSLATOR
 	GLboolean is_glsl;
 	binds_map semantics;
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 	glsl_samplers_info sized_samplers[SCE_GXM_MAX_TEXTURE_UNITS];
 	uint8_t sized_samplers_num;
-#endif
 #endif
 	int16_t ref_counter;
 	SceGxmShaderPatcherId id;
@@ -1140,12 +1140,12 @@ GLenum gxm_blend_eq_to_gl(SceGxmBlendFunc factor); // Converts SceGxmBlendFunc t
 void resetCustomShaders(void); // Resets custom shaders
 float *reserve_attrib_pool(uint8_t count);
 void _vglDrawObjects_CustomShadersIMPL(GLboolean implicit_wvp); // vglDrawObjects implementation for rendering with custom shaders
-GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, GLboolean is_short); // glDrawElements implementation for rendering with custom shaders
+GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, GLboolean is_short); // glDrawElements implementation for rendering with custom shaders
 GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean instanced); // glDrawArrays implementation for rendering with custom shaders
 void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *idx_buf, const GLint *first, const GLsizei *count, GLint lowest, GLsizei highest, GLsizei drawcount); // glMultiDrawArrays implementation for rendering with custom shaders
 
 /* ffp.c */
-void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, GLboolean is_short); // glDrawElements implementation for rendering with ffp
+void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_t top_idx, uint32_t base_idx, GLboolean is_short); // glDrawElements implementation for rendering with ffp
 void _glDrawArrays_FixedFunctionIMPL(GLint first, GLsizei count); // glDrawArrays implementation for rendering with ffp
 void _glMultiDrawArrays_FixedFunctionIMPL(SceGxmPrimitiveType gxm_p, uint16_t *idx_buf, const GLint *first, const GLsizei *count, GLint lowest, GLsizei highest, GLsizei drawcount); // glMultiDrawArrays implementation for rendering with ffp
 uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *streams, GLboolean is_short); // Reloads current in use ffp shaders

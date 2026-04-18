@@ -44,7 +44,7 @@ static void *fragment_usse_ring_buffer_addr; // fragment USSE ring buffer memblo
 
 static SceGxmRenderTarget *gxm_render_target; // Display render target
 SceGxmColorSurface gxm_color_surfaces[DISPLAY_MAX_BUFFER_COUNT]; // Display color surfaces
-uint8_t gxm_display_buffer_count = DISPLAY_MAX_BUFFER_COUNT; // Display buffers count
+uint8_t gxm_display_buffer_count = 3; // Display buffers count
 void *gxm_color_surfaces_addr[DISPLAY_MAX_BUFFER_COUNT]; // Display color surfaces memblock starting addresses
 static SceGxmSyncObject *gxm_sync_objects[DISPLAY_MAX_BUFFER_COUNT]; // Display sync objects
 unsigned int gxm_front_buffer_index; // Display front buffer id
@@ -302,11 +302,19 @@ int garbage_collector(unsigned int args, void *arg) {
 
 GLboolean startShaderCompiler(void) {
 	shark_set_allocators(vglMalloc, vglFree);
+#ifdef HAVE_VITA3K_SUPPORT
+	is_shark_online = shark_init_simple(NULL) >= 0;
+#else
 	is_shark_online = shark_init(NULL) >= 0;
+#endif
 
 	// If standard path failed to init we try to init it with ScePiglet path
 	if (!is_shark_online) {
+#ifdef HAVE_VITA3K_SUPPORT
+		is_shark_online = shark_init_simple("ur0:data/external/libshacccg.suprx") >= 0;
+#else
 		is_shark_online = shark_init("ur0:data/external/libshacccg.suprx") >= 0;
+#endif
 #ifdef LOG_ERRORS
 		if (!is_shark_online)
 			vgl_log("%s:%d Fatal error: SceShaccCg not found.\n", __FILE__, __LINE__);
@@ -781,9 +789,15 @@ void vglSwapBuffers(GLboolean has_commondialog) {
 #endif
 
 	vgl_framecount++;
-#ifdef HAVE_FAILSAFE_CIRCULAR_VERTEX_POOL
+#if !defined(DISABLE_CIRCULAR_POOL) && !defined(CIRCULAR_POOL_SPEEDHACK)
+#ifdef HAVE_DEBUG_INTERFACE
+	vgl_circular_pool_frame_peak = (uint32_t)circular_data_pool_ptr[vgl_circular_idx] - (uint32_t)circular_data_pool[vgl_circular_idx];
+	if (vgl_circular_pool_frame_peak > vgl_circular_pool_global_peak) {
+		vgl_circular_pool_global_peak = vgl_circular_pool_frame_peak;
+	}
+#endif
 	vgl_circular_idx = vgl_framecount % gxm_display_buffer_count;
-	vertex_data_pool_ptr[vgl_circular_idx] = vertex_data_pool[vgl_circular_idx];
+	circular_data_pool_ptr[vgl_circular_idx] = circular_data_pool[vgl_circular_idx];
 #endif
 
 	// Marking uniform values as dirty at each frame end just to be safe
