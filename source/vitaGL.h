@@ -1194,6 +1194,26 @@ typedef struct vglPendingTexture_s vglPendingTexture;
 // Allocates GPU memory and swizzles a block-compressed 2D texture. Safe to call from any thread, which lets the swizzling be performed off the rendering thread. Supported formats: GL_COMPRESSED_RGB_S3TC_DXT1_EXT, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT. Returns NULL on unsupported format or allocation failure.
 vglPendingTexture *vglPrepareCompressedTexture2D(GLenum internalformat, int width, int height, const void *data, GLsizei imageSize);
 
+// Variant for ALREADY-SWIZZLED data, skips the CPU swizzle and just memcpys
+// the bytes into GPU memory. The caller is responsible for matching the GXM
+// Morton layout for the POT-rounded dimensions; imageSize must equal
+// ((nearest_po2(width)+3)/4) * ((nearest_po2(height)+3)/4) * bytes_per_block.
+// Thread-safe like the swizzling variant. Same supported formats.
+vglPendingTexture *vglPrepareSwizzledCompressedTexture2D(GLenum internalformat, int width, int height, const void *data, GLsizei imageSize);
+
+// Allocate GPU memory for a compressed texture WITHOUT filling it. The caller
+// fills the buffer in place (via vglGetPendingTextureBuffer), for example,
+// fread directly from a file into GPU-mapped memory, then calls
+// vglCommitPendingTexture. Saves one CPU pass over the data vs. the variants
+// above. The bytes must end up in GXM Morton layout matching the POT-rounded
+// dimensions.
+vglPendingTexture *vglPrepareEmptyCompressedTexture2D(GLenum internalformat, int width, int height);
+
+// Accessors for use with vglPrepareEmptyCompressedTexture2D. The buffer is
+// CPU-writable until vglCommitPendingTexture. Size is the byte count to fill.
+void *vglGetPendingTextureBuffer(vglPendingTexture *pending);
+uint32_t vglGetPendingTextureSize(vglPendingTexture *pending);
+
 // Attaches a prepared texture to the currently bound GL_TEXTURE_2D and releases the handle. Must be called from the vitaGL owning thread. Current sampler parameters set via glTexParameteri are applied to the new texture.
 void vglCommitPendingTexture(vglPendingTexture *pending);
 

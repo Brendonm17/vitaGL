@@ -2546,6 +2546,118 @@ vglPendingTexture *vglPrepareCompressedTexture2D(GLenum internalformat, int widt
 	return p;
 }
 
+// Allocate a compressed-texture pending handle without filling its data. The
+// caller writes pre-swizzled bytes directly into the GPU-mapped buffer via
+// vglGetPendingTextureBuffer, then calls vglCommitPendingTexture as usual.
+// Skips one full copy of the data through CPU memory (vs. vglPrepareSwizzled*).
+vglPendingTexture *vglPrepareEmptyCompressedTexture2D(GLenum internalformat, int width, int height) {
+	if (width <= 0 || height <= 0)
+		return NULL;
+
+	SceGxmTextureFormat tex_format;
+	int bytes_per_block;
+	switch (internalformat) {
+	case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+	case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR;
+		bytes_per_block = 8;
+		break;
+	case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC2_ABGR;
+		bytes_per_block = 16;
+		break;
+	case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR;
+		bytes_per_block = 16;
+		break;
+	default:
+		return NULL;
+	}
+
+	const uint32_t aligned_width = nearest_po2(width);
+	const uint32_t aligned_height = nearest_po2(height);
+	const int tex_size = ((aligned_width + 3) / 4) * ((aligned_height + 3) / 4) * bytes_per_block;
+
+	void *texture_data = gpu_alloc_mapped(tex_size, VGL_MEM_MAIN);
+	if (!texture_data)
+		return NULL;
+
+	vglPendingTexture *p = (vglPendingTexture *)vgl_malloc(sizeof(vglPendingTexture), VGL_MEM_EXTERNAL);
+	if (!p) {
+		vgl_free(texture_data);
+		return NULL;
+	}
+	p->data = texture_data;
+	p->format = tex_format;
+	p->width = (uint32_t)width;
+	p->height = (uint32_t)height;
+	p->tex_size = (uint32_t)tex_size;
+	return p;
+}
+
+void *vglGetPendingTextureBuffer(vglPendingTexture *pending) {
+	return pending ? pending->data : NULL;
+}
+
+uint32_t vglGetPendingTextureSize(vglPendingTexture *pending) {
+	return pending ? pending->tex_size : 0;
+}
+
+vglPendingTexture *vglPrepareSwizzledCompressedTexture2D(GLenum internalformat, int width, int height, const void *data, GLsizei imageSize) {
+	if (!data || width <= 0 || height <= 0 || imageSize <= 0)
+		return NULL;
+
+	SceGxmTextureFormat tex_format;
+	int bytes_per_block;
+	switch (internalformat) {
+	case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+	case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR;
+		bytes_per_block = 8;
+		break;
+	case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC2_ABGR;
+		bytes_per_block = 16;
+		break;
+	case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR;
+		bytes_per_block = 16;
+		break;
+	default:
+		return NULL;
+	}
+
+	const uint32_t aligned_width = nearest_po2(width);
+	const uint32_t aligned_height = nearest_po2(height);
+	const int tex_size = ((aligned_width + 3) / 4) * ((aligned_height + 3) / 4) * bytes_per_block;
+
+	// imageSize MUST equal tex_size — caller is feeding us a pre-swizzled
+	// POT-sized buffer. Reject mismatches up front so we never read past
+	// the source or leave garbage in the GPU allocation.
+	if (imageSize != tex_size)
+		return NULL;
+
+	void *texture_data = gpu_alloc_mapped(tex_size, VGL_MEM_MAIN);
+	if (!texture_data)
+		return NULL;
+
+	// Pre-swizzled fast path: just memcpy. No NEON tile copy, no Morton
+	// math, no thread-context overhead. This is the whole point of v3.
+	memcpy(texture_data, data, tex_size);
+
+	vglPendingTexture *p = (vglPendingTexture *)vgl_malloc(sizeof(vglPendingTexture), VGL_MEM_EXTERNAL);
+	if (!p) {
+		vgl_free(texture_data);
+		return NULL;
+	}
+	p->data = texture_data;
+	p->format = tex_format;
+	p->width = (uint32_t)width;
+	p->height = (uint32_t)height;
+	p->tex_size = (uint32_t)tex_size;
+	return p;
+}
+
 void vglCommitPendingTexture(vglPendingTexture *pending) {
 	if (!pending)
 		return;
