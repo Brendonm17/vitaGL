@@ -1303,6 +1303,75 @@ void vglUseExtraMem(GLboolean usage);
 // Simplified function to enable or disable V-Sync. For more fine granularity on the swap interval use eglSwapInterval.
 void vglWaitVblankStart(GLboolean enable);
 
+
+// Opaque handle for a prepared texture, owned by vitaGL until committed or freed.
+typedef struct vglPendingTexture_s vglPendingTexture;
+
+// Allocates GPU memory and swizzles a DXT1/DXT3/DXT5 texture into it. Thread
+// safe, the swizzle runs on the calling thread. Returns NULL on failure.
+vglPendingTexture *vglPrepareCompressedTexture2D(GLenum internalformat, int width, int height, const void *data, GLsizei imageSize);
+
+// Same, for data already in GXM swizzled layout: imageSize must match the size
+// of the POT-rounded texture exactly. Thread safe. Returns NULL on failure.
+vglPendingTexture *vglPrepareSwizzledCompressedTexture2D(GLenum internalformat, int width, int height, const void *data, GLsizei imageSize);
+
+// Attaches a prepared texture to the currently bound GL_TEXTURE_2D and frees
+// the handle. Main thread only.
+void vglCommitPendingTexture(vglPendingTexture *pending);
+
+// Releases a prepared texture that was never committed.
+void vglFreePendingTexture(vglPendingTexture *pending);
+
+// Opaque handle for prepared buffer data, owned by vitaGL until committed or freed.
+typedef struct vglPendingBuffer_s vglPendingBuffer;
+
+// Allocates GPU memory and copies size bytes of buffer data into it on the
+// calling thread. Thread safe. Returns NULL on failure.
+vglPendingBuffer *vglPrepareBufferData(const void *data, GLsizei size);
+
+// Attaches prepared storage to a buffer object (or to the current
+// GL_ARRAY_BUFFER binding if buffer is 0) and frees the handle. Main thread only.
+void vglCommitPendingBuffer(GLuint buffer, vglPendingBuffer *pending);
+
+// Releases prepared buffer data that was never committed.
+void vglFreePendingBuffer(vglPendingBuffer *pending);
+
+// Per-phase draw timings, only active on DRAW_PHASE_PROFILING builds.
+// Reset once per frame before submitting draws.
+void vgl_reset_draw_phases(void);
+
+// Reads back the accumulated microseconds: 0=frag_tex, 1=vert_tex,
+// 2=align_attrs, 3=patch_vprog, 4=upload_unif, 5=vstreams.
+void vgl_get_draw_phases(unsigned int out[6]);
+
+// GXM fast path. In any nonzero mode both draw entrypoints skip the texture
+// loops and the caller owns texture state for the whole pass.
+//  1 = glDrawElements pass. Same-program draws early-out to uniform upload;
+//      vertex program, attributes and stream bases all persist, so the caller
+//      must address one buffer that never moves.
+//  2 = glDrawArrays pass. Same-program draws re-set the stream bases from the
+//      current GL attrib state (the bound VBO may change per draw), but the
+//      attribute layout must stay identical for the whole pass.
+extern int vgl_fast_draw_mode;
+SceGxmContext* vglGetGxmContext(void);
+const SceGxmTexture* vglGetGxmTextureById(GLuint gl_tex_id);
+
+// Re-arms the fast path: the next fast-mode draw takes the full setup path once
+// before same-program draws start early-outing. Required at every fast-pass
+// entry, state left behind by draws outside fast mode cannot be reused.
+void vgl_fast_draw_reset(void);
+
+// Arms the fast path against the current program without a transition draw.
+// Only legal right after a full-path mode 0 draw made with the same attrib and
+// VBO state the fast-mode draws will use. When in doubt, reset instead.
+void vgl_fast_draw_arm(void);
+
+// Clears the internal sceGxm state dedup cache (no-op unless built with
+// DRAW_STATE_CACHE). Call after issuing raw sceGxm state so the next normal
+// draw re-emits it.
+void vgl_draw_state_cache_reset(void);
+
+
 #ifdef __cplusplus
 }
 #endif

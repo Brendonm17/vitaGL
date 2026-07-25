@@ -24,6 +24,31 @@
 #define _GNU_SOURCE
 #include <string.h>
 #include "shared.h"
+
+// Fast-draw modes, described in vitaGL.h. Each mode's early-out is gated on its
+// exact value so the two passes cannot consume each other's pipeline state.
+int vgl_fast_draw_mode = 0;
+
+// Program of the last fast-mode draw that took the full setup path. While it
+// matches cur_program, fast-mode draws are allowed to early-out.
+static GLuint vgl_last_fast_prog = 0;
+
+void vgl_fast_draw_reset(void) {
+    vgl_last_fast_prog = 0;
+}
+
+void vgl_fast_draw_arm(void) {
+    vgl_last_fast_prog = cur_program;
+}
+
+SceGxmContext* vglGetGxmContext(void) {
+    return gxm_context;
+}
+
+const SceGxmTexture* vglGetGxmTextureById(GLuint gl_tex_id) {
+    if (gl_tex_id == 0 || gl_tex_id >= TEXTURES_NUM) return NULL;
+    return &texture_slots[gl_tex_id].gxm_tex;
+}
 #include "utils/glsl_utils.h"
 #include "utils/shacccg_paramquery.h"
 #if defined(HAVE_SHADER_CACHE) || defined(HAVE_TEX_CACHE)
@@ -122,9 +147,12 @@ char vgl_file_cache_path[256];
 		} \
 	}
 
+// SceGxmVertexAttribute.offset is a uint16_t, so an absolute VBO offset above
+// 64KB would truncate here. Bake the relative intra-stride offset only, call
+// sites fold the attr0 base offset into the 32 bit stream pointer instead.
 #define handle_packed_vbo_attrib() \
 	if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
-		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx]; \
+		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx] - cur_vao->vertex_attrib_offsets[p->attr_map[0]]; \
 	} else { \
 		disable_draw_attrib(i) \
 	}	
@@ -224,7 +252,7 @@ char vgl_file_cache_path[256];
 		p->blend_info.raw = blend_info.raw; \
 		rebuild_frag_shader(p->fshader->id, &p->fprog, (SceGxmProgram *)p->vshader->prog, is_fbo_float ? SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4); \
 	} \
-	sceGxmSetFragmentProgram(gxm_context, p->fprog);
+	VGL_SET_FPROG(p->fprog);
 	
 #define align_attributes(attributes, streams) \
 	if (p->has_unaligned_attrs) { \
@@ -261,6 +289,105 @@ static uint32_t ubo_offset[UBOS_NUM];
 static uint8_t tex2d_override = 0;
 GLboolean dirty_shader_frag_unifs = GL_TRUE;
 GLboolean dirty_shader_vert_unifs = GL_TRUE;
+
+#ifdef DRAW_PHASE_PROFILING
+static uint32_t phase_counters[6] = {0};
+#define PHASE_FRAG_TEX    0
+#define PHASE_VERT_TEX    1
+#define PHASE_ALIGN_ATTRS 2
+#define PHASE_PATCH_VPROG 3
+#define PHASE_UPLOAD_UNIF 4
+#define PHASE_VSTREAMS    5
+
+#define PHASE_BEGIN(idx) uint32_t __ph_##idx = sceKernelGetProcessTimeLow()
+#define PHASE_END(idx)   phase_counters[PHASE_##idx] += sceKernelGetProcessTimeLow() - __ph_##idx
+
+void vgl_reset_draw_phases(void) {
+    for (int i = 0; i < 6; i++) phase_counters[i] = 0;
+}
+
+void vgl_get_draw_phases(unsigned int out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = phase_counters[i];
+}
+#else
+#define PHASE_BEGIN(idx) ((void)0)
+#define PHASE_END(idx)   ((void)0)
+
+void vgl_reset_draw_phases(void) {}
+
+void vgl_get_draw_phases(unsigned int out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = 0;
+}
+#endif
+
+#ifdef DRAW_STATE_CACHE
+static const SceGxmTexture *last_frag_tex_cache[16];
+static const SceGxmTexture *last_vert_tex_cache[16];
+static const void *last_vstream_cache[VERTEX_ATTRIBS_NUM];
+static SceGxmVertexProgram *last_vprog_cache;
+static SceGxmFragmentProgram *last_fprog_cache;
+
+void vgl_draw_state_cache_reset(void) {
+    for (int i = 0; i < 16; i++) { last_frag_tex_cache[i] = NULL; last_vert_tex_cache[i] = NULL; }
+    for (int i = 0; i < VERTEX_ATTRIBS_NUM; i++) last_vstream_cache[i] = NULL;
+    last_vprog_cache = NULL;
+    last_fprog_cache = NULL;
+}
+
+// For callers that set v/f programs directly, leaves the rest of the cache alone
+void vgl_draw_state_cache_invalidate_programs(void) {
+    last_vprog_cache = NULL;
+    last_fprog_cache = NULL;
+}
+
+#define VGL_SET_FRAG_TEX(unit, tex) do { \
+    if (last_frag_tex_cache[(unit)] != (tex)) { \
+        sceGxmSetFragmentTexture(gxm_context, (unit), (tex)); \
+        last_frag_tex_cache[(unit)] = (tex); \
+    } \
+} while (0)
+
+#define VGL_SET_VERT_TEX(unit, tex) do { \
+    if (last_vert_tex_cache[(unit)] != (tex)) { \
+        sceGxmSetVertexTexture(gxm_context, (unit), (tex)); \
+        last_vert_tex_cache[(unit)] = (tex); \
+    } \
+} while (0)
+
+#define VGL_SET_VSTREAM(idx, ptr) do { \
+    if (last_vstream_cache[(idx)] != (const void *)(ptr)) { \
+        sceGxmSetVertexStream(gxm_context, (idx), (ptr)); \
+        last_vstream_cache[(idx)] = (const void *)(ptr); \
+    } \
+} while (0)
+
+#define VGL_SET_VPROG(prog) do { \
+    if (last_vprog_cache != (prog)) { \
+        sceGxmSetVertexProgram(gxm_context, (prog)); \
+        last_vprog_cache = (prog); \
+    } \
+} while (0)
+
+#define VGL_SET_FPROG(prog) do { \
+    if (last_fprog_cache != (prog)) { \
+        sceGxmSetFragmentProgram(gxm_context, (prog)); \
+        last_fprog_cache = (prog); \
+    } \
+} while (0)
+
+#else // !DRAW_STATE_CACHE
+
+// Nothing to reset here, stub kept so external callers still link
+void vgl_draw_state_cache_reset(void) {
+}
+
+#define VGL_SET_FRAG_TEX(unit, tex)  sceGxmSetFragmentTexture(gxm_context, (unit), (tex))
+#define VGL_SET_VERT_TEX(unit, tex)  sceGxmSetVertexTexture(gxm_context, (unit), (tex))
+#define VGL_SET_VSTREAM(idx, ptr)    sceGxmSetVertexStream(gxm_context, (idx), (ptr))
+#define VGL_SET_VPROG(prog)          sceGxmSetVertexProgram(gxm_context, (prog))
+#define VGL_SET_FPROG(prog)          sceGxmSetFragmentProgram(gxm_context, (prog))
+
+#endif // DRAW_STATE_CACHE
 
 typedef struct {
 	GLuint idx;
@@ -729,7 +856,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_FRAG_TEX(i, &tex->gxm_tex);
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
 			if (info) {
@@ -774,7 +901,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 				vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetVertexTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_VERT_TEX(i, &tex->gxm_tex);
 #ifndef SAMPLERS_SPEEDHACK
 		}
 #endif
@@ -839,7 +966,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 	// Gathering real attribute data pointers
 	if (is_packed) {
 		if (target_vbo) {
-			ptrs[0] = (void *)target_vbo->ptr + lowest * streams[0].stride;
+			ptrs[0] = (void *)target_vbo->ptr + cur_vao->vertex_attrib_offsets[p->attr_map[0]] + lowest * streams[0].stride;
 			target_vbo->last_frame = vgl_framecount;
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
@@ -872,7 +999,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 
 	// Uploading new vertex program
 	patch_vertex_program(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
-	sceGxmSetVertexProgram(gxm_context, p->vprog);
+	VGL_SET_VPROG(p->vprog);
 
 	// Uploading both fragment and vertex uniforms data
 	upload_uniforms();
@@ -885,14 +1012,14 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 			if (is_active) {
 #ifdef STRICT_DRAW_COMPLIANCE
 				if (is_packed[i])
-					sceGxmSetVertexStream(gxm_context, i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
+					VGL_SET_VSTREAM(i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
 				else
-					sceGxmSetVertexStream(gxm_context, i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
+					VGL_SET_VSTREAM(i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
 #else
 				if (is_packed)
-					sceGxmSetVertexStream(gxm_context, i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
+					VGL_SET_VSTREAM(i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
 				else
-					sceGxmSetVertexStream(gxm_context, i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
+					VGL_SET_VSTREAM(i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
 #endif
 			}
 		}
@@ -915,6 +1042,8 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 	setup_frag_program();
 
 	// Uploading fragment textures on relative texture units
+	PHASE_BEGIN(FRAG_TEX);
+	if (!vgl_fast_draw_mode)
 	for (int i = 0; i < p->max_frag_texunit_idx; i++) {
 #ifndef SAMPLERS_SPEEDHACK
 		if (p->frag_texunits[i]) {
@@ -948,7 +1077,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_FRAG_TEX(i, &tex->gxm_tex);
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
 			if (info) {
@@ -965,6 +1094,9 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 	}
 
 	// Uploading vertex textures on relative texture units
+	PHASE_END(FRAG_TEX);
+	PHASE_BEGIN(VERT_TEX);
+	if (!vgl_fast_draw_mode)
 	for (int i = 0; i < p->max_vert_texunit_idx; i++) {
 #ifndef SAMPLERS_SPEEDHACK
 		if (p->vert_texunits[i]) {
@@ -993,10 +1125,53 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 				vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetVertexTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_VERT_TEX(i, &tex->gxm_tex);
 #ifndef SAMPLERS_SPEEDHACK
 		}
 #endif
+	}
+
+	// glDrawArrays fast pass: skip align+patch on same-program draws but still
+	// re-set the stream bases, since the bound VBO changes per draw. Only the
+	// packed single-VBO, attr0-offset-0, all-attribs-enabled, non-instanced
+	// layout keeps the patched vertex program valid, anything else takes the
+	// full path and disarms so its layout can't be reused by a later draw.
+	if (vgl_fast_draw_mode == 2) {
+		vbo *fast_vbo = (vbo *)cur_vao->vertex_attrib_vbo[p->attr_map[0]];
+		GLboolean fast_ok = !instanced && fast_vbo &&
+			cur_vao->vertex_attrib_offsets[p->attr_map[0]] == 0;
+		if (fast_ok) {
+			for (int i = 0; i < p->attr_num; i++) {
+				uint8_t attr_idx = p->attr_map[i];
+				if (!(cur_vao->vertex_attrib_state & (1 << attr_idx)) ||
+					(vbo *)cur_vao->vertex_attrib_vbo[attr_idx] != fast_vbo) {
+					fast_ok = GL_FALSE;
+					break;
+				}
+			}
+		}
+		if (fast_ok && cur_program == vgl_last_fast_prog) {
+			PHASE_END(VERT_TEX);
+			// Packed layout, so every stream shares the same base
+			PHASE_BEGIN(VSTREAMS);
+			uint8_t *fast_base = (uint8_t *)fast_vbo->ptr +
+				first * cur_vao->vertex_stream_config[p->attr_map[0]].stride;
+			for (int i = 0; i < p->attr_num; i++) {
+				VGL_SET_VSTREAM(i, fast_base);
+			}
+			fast_vbo->last_frame = vgl_framecount;
+			PHASE_END(VSTREAMS);
+			PHASE_BEGIN(UPLOAD_UNIF);
+			upload_uniforms();
+			PHASE_END(UPLOAD_UNIF);
+#ifdef HAVE_PROFILING
+			shaders_draw_profiler_cnt += sceKernelGetProcessTimeLow() - draw_start;
+			shaders_draw_cnt++;
+#endif
+			return GL_TRUE;
+		}
+		// Only arm when this full-path draw baked an eligible layout
+		vgl_last_fast_prog = fast_ok ? cur_program : 0;
 	}
 
 	// Aligning attributes
@@ -1005,6 +1180,8 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 	align_attributes(attributes, streams);
 
 	void *ptrs[VERTEX_ATTRIBS_NUM];
+	PHASE_END(VERT_TEX);
+	PHASE_BEGIN(ALIGN_ATTRS);
 #ifndef DRAW_SPEEDHACK
 	vbo *target_vbo = (vbo *)cur_vao->vertex_attrib_vbo[p->attr_map[0]];
 #ifdef STRICT_DRAW_COMPLIANCE
@@ -1066,7 +1243,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 	// Gathering real attribute data pointers
 	if (is_packed) {
 		if (target_vbo) {
-			ptrs[0] = (void *)target_vbo->ptr + first * streams[0].stride;
+			ptrs[0] = (void *)target_vbo->ptr + cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride;
 			target_vbo->last_frame = vgl_framecount;
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
@@ -1115,11 +1292,17 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 #endif
 
 	// Uploading new vertex program
+	PHASE_END(ALIGN_ATTRS);
+	PHASE_BEGIN(PATCH_VPROG);
 	patch_vertex_program(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
-	sceGxmSetVertexProgram(gxm_context, p->vprog);
+	VGL_SET_VPROG(p->vprog);
 
 	// Uploading both fragment and vertex uniforms data
+	PHASE_END(PATCH_VPROG);
+	PHASE_BEGIN(UPLOAD_UNIF);
 	upload_uniforms();
+	PHASE_END(UPLOAD_UNIF);
+	PHASE_BEGIN(VSTREAMS);
 
 	// Uploading vertex streams
 	for (int i = 0; i < p->attr_num; i++) {
@@ -1127,16 +1310,16 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 		GLboolean is_active = (cur_vao->vertex_attrib_state & (1 << attr_idx)) ? GL_TRUE : GL_FALSE;
 		if (is_active) {
 #ifdef DRAW_SPEEDHACK
-			sceGxmSetVertexStream(gxm_context, i, ptrs[i]);
+			VGL_SET_VSTREAM(i, ptrs[i]);
 #else
 #ifdef STRICT_DRAW_COMPLIANCE
-			sceGxmSetVertexStream(gxm_context, i, is_packed[i] ? ptrs[0] : ptrs[i]);
+			VGL_SET_VSTREAM(i, is_packed[i] ? ptrs[0] : ptrs[i]);
 #else
-			sceGxmSetVertexStream(gxm_context, i, is_packed ? ptrs[0] : ptrs[i]);
+			VGL_SET_VSTREAM(i, is_packed ? ptrs[0] : ptrs[i]);
 #endif
 #endif
 		} else {
-			sceGxmSetVertexStream(gxm_context, i, cur_vao->vertex_attrib_value[attr_idx]);
+			VGL_SET_VSTREAM(i, cur_vao->vertex_attrib_value[attr_idx]);
 		}
 		if (!p->has_unaligned_attrs) {
 			attributes[i].regIndex = i;
@@ -1151,6 +1334,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 	shaders_draw_profiler_cnt += sceKernelGetProcessTimeLow() - draw_start;
 	shaders_draw_cnt++;
 #endif
+	PHASE_END(VSTREAMS);
 	return GL_TRUE;
 }
 
@@ -1164,6 +1348,8 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 	setup_frag_program();
 
 	// Uploading fragment textures on relative texture units
+	PHASE_BEGIN(FRAG_TEX);
+	if (!vgl_fast_draw_mode)
 	for (int i = 0; i < p->max_frag_texunit_idx; i++) {
 #ifndef SAMPLERS_SPEEDHACK
 		if (p->frag_texunits[i]) {
@@ -1197,7 +1383,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_FRAG_TEX(i, &tex->gxm_tex);
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
 			if (info) {
@@ -1212,8 +1398,11 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 		}
 #endif
 	}
+	PHASE_END(FRAG_TEX);
 
 	// Uploading vertex textures on relative texture units
+	PHASE_BEGIN(VERT_TEX);
+	if (!vgl_fast_draw_mode)
 	for (int i = 0; i < p->max_vert_texunit_idx; i++) {
 #ifndef SAMPLERS_SPEEDHACK
 		if (p->vert_texunits[i]) {
@@ -1242,13 +1431,28 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 				vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
 				tex->overridden = GL_FALSE;
 			}
-			sceGxmSetVertexTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_VERT_TEX(i, &tex->gxm_tex);
 #ifndef SAMPLERS_SPEEDHACK
 		}
 #endif
 	}
+	PHASE_END(VERT_TEX);
+
+	// glDrawElements fast pass: vprog, attributes and streams all persist from
+	// the previous draw, so jump straight to the uniform upload. Gated on mode
+	// 1 exactly, mode 2 stream bases move per draw and must not land here.
+	if (vgl_fast_draw_mode == 1) {
+		if (cur_program == vgl_last_fast_prog) {
+			PHASE_BEGIN(UPLOAD_UNIF);
+			upload_uniforms();
+			PHASE_END(UPLOAD_UNIF);
+			return GL_TRUE;
+		}
+		vgl_last_fast_prog = cur_program;
+	}
 
 	// Aligning attributes
+	PHASE_BEGIN(ALIGN_ATTRS);
 	SceGxmVertexAttribute *attributes;
 	SceGxmVertexStream *streams;
 	align_attributes(attributes, streams);
@@ -1341,7 +1545,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 	// Gathering real attribute data pointers
 	if (is_packed) {
 		if (target_vbo) {
-			ptrs[0] = (void *)target_vbo->ptr;
+			ptrs[0] = (void *)target_vbo->ptr + cur_vao->vertex_attrib_offsets[p->attr_map[0]];
 			target_vbo->last_frame = vgl_framecount;
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
@@ -1393,30 +1597,36 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 		}
 	}
 #endif
+	PHASE_END(ALIGN_ATTRS);
 
 	// Uploading new vertex program
+	PHASE_BEGIN(PATCH_VPROG);
 	patch_vertex_program(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
-	sceGxmSetVertexProgram(gxm_context, p->vprog);
+	VGL_SET_VPROG(p->vprog);
+	PHASE_END(PATCH_VPROG);
 
 	// Uploading both fragment and vertex uniforms data
+	PHASE_BEGIN(UPLOAD_UNIF);
 	upload_uniforms();
+	PHASE_END(UPLOAD_UNIF);
 
 	// Uploading vertex streams
+	PHASE_BEGIN(VSTREAMS);
 	for (int i = 0; i < p->attr_num; i++) {
 		uint8_t attr_idx = p->attr_map[i];
 		GLboolean is_active = (cur_vao->vertex_attrib_state & (1 << attr_idx)) ? GL_TRUE : GL_FALSE;
 		if (is_active) {
 #ifdef DRAW_SPEEDHACK
-			sceGxmSetVertexStream(gxm_context, i, ptrs[i]);
+			VGL_SET_VSTREAM(i, ptrs[i]);
 #else
 #ifdef STRICT_DRAW_COMPLIANCE
-			sceGxmSetVertexStream(gxm_context, i, is_packed[i] ? ptrs[0] : ptrs[i]);
+			VGL_SET_VSTREAM(i, is_packed[i] ? ptrs[0] : ptrs[i]);
 #else
-			sceGxmSetVertexStream(gxm_context, i, is_packed ? ptrs[0] : ptrs[i]);
+			VGL_SET_VSTREAM(i, is_packed ? ptrs[0] : ptrs[i]);
 #endif
 #endif
 		} else {
-			sceGxmSetVertexStream(gxm_context, i, cur_vao->vertex_attrib_value[attr_idx]);
+			VGL_SET_VSTREAM(i, cur_vao->vertex_attrib_value[attr_idx]);
 		}
 		if (!p->has_unaligned_attrs) {
 			attributes[i].regIndex = i;
@@ -1427,6 +1637,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 			}
 		}
 	}
+	PHASE_END(VSTREAMS);
 #ifdef HAVE_PROFILING
 	shaders_draw_profiler_cnt += sceKernelGetProcessTimeLow() - draw_start;
 	shaders_draw_cnt++;
@@ -1445,7 +1656,7 @@ void _vglDrawObjects_CustomShadersIMPL() {
 	setup_frag_program();
 
 	// Setting up required vertex shader
-	sceGxmSetVertexProgram(gxm_context, p->vprog);
+	VGL_SET_VPROG(p->vprog);
 
 	// Uploading textures on relative texture units
 	for (int i = 0; i < p->max_frag_texunit_idx; i++) {
@@ -1456,7 +1667,7 @@ void _vglDrawObjects_CustomShadersIMPL() {
 #ifndef TEXTURES_SPEEDHACK
 			tex->last_frame = vgl_framecount;
 #endif
-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+			VGL_SET_FRAG_TEX(i, &tex->gxm_tex);
 #ifdef HAVE_GLSL_TEXTURE_SIZE
 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
 			if (info) {

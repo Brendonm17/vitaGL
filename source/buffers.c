@@ -960,3 +960,77 @@ void vglSetVertexAttribPoolSize(uint32_t main_size, uint32_t aux_size) {
 	main_vertex_attrib_pool_size = main_size;
 	aux_vertex_attrib_pool_size = aux_size;
 }
+
+// Off-thread buffer data preparation: prepare does the allocation and the copy
+// on the calling thread, commit attaches the storage on the main thread. End
+// state matches glNamedBufferData with GL_STATIC_DRAW.
+struct vglPendingBuffer_s {
+	void *ptr;
+	int32_t size;
+};
+
+vglPendingBuffer *vglPrepareBufferData(const void *data, GLsizei size) {
+	if (!data || size <= 0)
+		return NULL;
+
+	void *ptr = gpu_alloc_mapped_for_gpu(size);
+	if (!ptr)
+		return NULL;
+	vgl_fast_memcpy(ptr, data, size);
+
+	vglPendingBuffer *p = (vglPendingBuffer *)vgl_malloc(sizeof(vglPendingBuffer), VGL_MEM_EXTERNAL);
+	if (!p) {
+		vgl_free(ptr);
+		return NULL;
+	}
+	p->ptr = ptr;
+	p->size = size;
+	return p;
+}
+
+void vglCommitPendingBuffer(GLuint buffer, vglPendingBuffer *pending) {
+	if (!pending)
+		return;
+
+	// buffer 0 targets the current GL_ARRAY_BUFFER binding
+	vbo *gpu_buf = buffer ? (vbo *)buffer : (vbo *)vertex_array_unit;
+	if (!gpu_buf) {
+		// nothing to attach to, don't leak the prepared storage
+		vglFreePendingBuffer(pending);
+		return;
+	}
+
+#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
+	GLboolean was_scratch = gpu_buf->scratch;
+	gpu_buf->scratch = GL_FALSE;
+#endif
+	// GL_STATIC_DRAW pool class
+	gpu_buf->alloc_func = gpu_alloc_mapped_for_gpu;
+
+	// Marking previous content for deletion or deleting it straight if unused
+#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
+	if (gpu_buf->ptr && !was_scratch) {
+#else
+	if (gpu_buf->ptr) {
+#endif
+		if (gpu_buf->last_frame != OBJ_NOT_USED && (vgl_framecount - gpu_buf->last_frame <= FRAME_PURGE_FREQ)) {
+			mark_as_dirty(gpu_buf->ptr);
+		} else {
+			vgl_free(gpu_buf->ptr);
+		}
+	}
+
+	gpu_buf->ptr = pending->ptr;
+	gpu_buf->size = pending->size;
+	gpu_buf->last_frame = OBJ_NOT_USED;
+
+	vgl_free(pending);
+}
+
+void vglFreePendingBuffer(vglPendingBuffer *pending) {
+	if (!pending)
+		return;
+	if (pending->ptr)
+		vgl_free(pending->ptr);
+	vgl_free(pending);
+}

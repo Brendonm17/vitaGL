@@ -577,6 +577,12 @@ void scene_reset(void) {
 		in_use_framebuffer = active_write_fb;
 		is_fbo_float = in_use_framebuffer ? in_use_framebuffer->is_float : GL_FALSE;
 
+#ifdef DRAW_STATE_CACHE
+		// sceGxmBeginScene below resets all GXM state
+		extern void vgl_draw_state_cache_reset(void);
+		vgl_draw_state_cache_reset();
+#endif
+
 		// Ending drawing scene
 		if (needs_end_scene) {
 			scene_end();
@@ -797,6 +803,12 @@ void vglSwapBuffers(GLboolean has_commondialog) {
 	dirty_shader_frag_unifs = GL_TRUE;
 	dirty_shader_vert_unifs = GL_TRUE;
 	needs_end_scene = GL_FALSE;
+
+#ifdef DRAW_STATE_CACHE
+	// The first draw of the next frame has to re-issue every set command
+	extern void vgl_draw_state_cache_reset(void);
+	vgl_draw_state_cache_reset();
+#endif
 
 	if (!needs_scene_reset)
 		scene_end();

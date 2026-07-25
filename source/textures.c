@@ -22,6 +22,7 @@
  */
 
 #include "shared.h"
+#include "utils/texture_swizzler.h"
 
 #ifdef HAVE_UNPURE_TEXFORMATS
 #define resolve_tex_target(target, unresolved_action) \
@@ -2731,4 +2732,176 @@ SceGxmTexture *vglGetGxmTexture(GLenum target) {
 	default:
 		SET_GL_ERROR_WITH_RET(GL_INVALID_ENUM, NULL)
 	}
+}
+
+// Off-thread compressed texture preparation: the allocation and the swizzle
+// run on the calling thread, only the descriptor init is left for commit.
+struct vglPendingTexture_s {
+	void *data;
+	SceGxmTextureFormat format;
+	uint32_t width;
+	uint32_t height;
+	uint32_t tex_size;
+};
+
+vglPendingTexture *vglPrepareCompressedTexture2D(GLenum internalformat, int width, int height, const void *data, GLsizei imageSize) {
+	if (!data || width <= 0 || height <= 0 || imageSize <= 0)
+		return NULL;
+
+	SceGxmTextureFormat tex_format;
+	int bytes_per_block;
+	switch (internalformat) {
+	case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+	case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR;
+		bytes_per_block = 8;
+		break;
+	case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC2_ABGR;
+		bytes_per_block = 16;
+		break;
+	case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR;
+		bytes_per_block = 16;
+		break;
+	default:
+		return NULL;
+	}
+
+	const uint32_t aligned_width = nearest_po2(width);
+	const uint32_t aligned_height = nearest_po2(height);
+	// level 0 size, matching gpu_get_compressed_mipchain_size
+	const int tex_size = ((aligned_width + 3) / 4) * ((aligned_height + 3) / 4) * bytes_per_block;
+
+	void *texture_data = gpu_alloc_mapped_for_gpu(tex_size);
+	if (!texture_data)
+		return NULL;
+
+	// swizzling straight into the GPU allocation, SwizzleTexData* is pure CPU
+	switch (tex_format) {
+	case SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR:
+		SwizzleTexData64Bpp((uint8_t *)texture_data, (uint8_t *)data, 0, 0,
+			ALIGNBLOCK(width, 4), ALIGNBLOCK(height, 4),
+			ALIGNBLOCK(width, 4), ALIGNBLOCK(MIN(aligned_width, aligned_height), 4));
+		break;
+	case SCE_GXM_TEXTURE_FORMAT_UBC2_ABGR:
+	case SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR:
+		SwizzleTexData128Bpp((uint8_t *)texture_data, (uint8_t *)data, 0, 0,
+			ALIGNBLOCK(width, 4), ALIGNBLOCK(height, 4),
+			ALIGNBLOCK(width, 4), ALIGNBLOCK(MIN(aligned_width, aligned_height), 4));
+		break;
+	default:
+		vgl_free(texture_data);
+		return NULL;
+	}
+
+	vglPendingTexture *p = (vglPendingTexture *)vgl_malloc(sizeof(vglPendingTexture), VGL_MEM_EXTERNAL);
+	if (!p) {
+		vgl_free(texture_data);
+		return NULL;
+	}
+	p->data = texture_data;
+	p->format = tex_format;
+	p->width = (uint32_t)width;
+	p->height = (uint32_t)height;
+	p->tex_size = (uint32_t)tex_size;
+	return p;
+}
+
+vglPendingTexture *vglPrepareSwizzledCompressedTexture2D(GLenum internalformat, int width, int height, const void *data, GLsizei imageSize) {
+	if (!data || width <= 0 || height <= 0 || imageSize <= 0)
+		return NULL;
+
+	SceGxmTextureFormat tex_format;
+	int bytes_per_block;
+	switch (internalformat) {
+	case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+	case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC1_ABGR;
+		bytes_per_block = 8;
+		break;
+	case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC2_ABGR;
+		bytes_per_block = 16;
+		break;
+	case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+		tex_format = SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR;
+		bytes_per_block = 16;
+		break;
+	default:
+		return NULL;
+	}
+
+	const uint32_t aligned_width = nearest_po2(width);
+	const uint32_t aligned_height = nearest_po2(height);
+	const int tex_size = ((aligned_width + 3) / 4) * ((aligned_height + 3) / 4) * bytes_per_block;
+
+	// source is already swizzled and POT-sized, so a short buffer would be
+	// read past the end
+	if (imageSize != tex_size)
+		return NULL;
+
+	void *texture_data = gpu_alloc_mapped_for_gpu(tex_size);
+	if (!texture_data)
+		return NULL;
+
+	memcpy(texture_data, data, tex_size);
+
+	vglPendingTexture *p = (vglPendingTexture *)vgl_malloc(sizeof(vglPendingTexture), VGL_MEM_EXTERNAL);
+	if (!p) {
+		vgl_free(texture_data);
+		return NULL;
+	}
+	p->data = texture_data;
+	p->format = tex_format;
+	p->width = (uint32_t)width;
+	p->height = (uint32_t)height;
+	p->tex_size = (uint32_t)tex_size;
+	return p;
+}
+
+void vglCommitPendingTexture(vglPendingTexture *pending) {
+	if (!pending)
+		return;
+
+	texture_unit *tex_unit = &texture_units[server_texture_unit];
+	int texture2d_idx = tex_unit->tex_id[0];
+	texture *tex = &texture_slots[texture2d_idx];
+
+	// releasing whatever was on this slot before
+	if (tex->status == TEX_VALID)
+		gpu_free_texture_data(tex);
+
+	tex->mip_count = 1;
+	vglInitSwizzledTexture(&tex->gxm_tex, pending->data, pending->format,
+		pending->width, pending->height, 0);
+	tex->palette_data = NULL;
+	tex->status = TEX_VALID;
+	tex->data = pending->data;
+#ifndef TEXTURES_SPEEDHACK
+	tex->last_frame = OBJ_NOT_USED;
+#endif
+
+	// applying currently set sampler state
+	vglSetTexUMode(&tex->gxm_tex, tex->u_mode);
+	vglSetTexVMode(&tex->gxm_tex, tex->v_mode);
+	vglSetTexMinFilter(&tex->gxm_tex, tex->min_filter);
+	vglSetTexMagFilter(&tex->gxm_tex, tex->mag_filter);
+	vglSetTexMipFilter(&tex->gxm_tex, tex->mip_filter);
+	vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
+	vglSetTexMipmapCount(&tex->gxm_tex, 0);
+
+#ifdef HAVE_TEX_CACHE
+	markAsCacheable(tex)
+#endif
+
+	vgl_free(pending);
+}
+
+void vglFreePendingTexture(vglPendingTexture *pending) {
+	if (!pending)
+		return;
+	if (pending->data)
+		vgl_free(pending->data);
+	vgl_free(pending);
 }
