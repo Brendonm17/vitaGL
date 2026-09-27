@@ -1059,6 +1059,50 @@ void *vglForceAlloc(uint32_t size);
 // Frees a previously allocated memory block in the vitaGL internal memory pools.
 void vglFree(void *addr);
 
+// Ends + submits the current display scene and waits for the GPU so a following glReadPixels on the default framebuffer reads CURRENT frame content; the next draw re-begins the scene on the same back buffer (no swap). Pair with vglSetDisplayDepthPersistence for depth continuity across the split. Safe no-op with no active scene or inside an FBO.
+void vglFlushFrame(void);
+
+// [EFB-ASYNC] Ends + submits the current display scene WITHOUT sceGxmFinish, and arms the same-back-buffer restart at the next draw. Unlike vglFlushFrame, returns immediately: pair with vglCaptureFramebufferRegion() for a notification-fenced EFB region copy. Same no-op guards as vglFlushFrame.
+void vglSceneSubmit(void);
+
+// [EFB-ASYNC v3] DMA-copy a rect of the CURRENT default color surface into a GL texture's linear RGBA8 storage via the transfer unit (no CPU readback, no full-pipeline stall). Call only after vglSceneSubmit(). Race-free by construction via explicit notifications: the call CPU-waits the split scene's fragment fence (query_fence — the fragment job has retired, so the source is complete) before enqueuing the transfer, and the transfer signals a notification that sceneEnd waits before submitting any later fragment job (so nothing overwrites the source or samples the dst mid-transfer). NOTE (device-proven, v1/v2 post-mortem): transfer-queue submission order is NOT ordering vs the render queue, and the display sync objects (sceGxmDisplayQueueAddEntry epoch) are the WRONG fence — both flickered stale on alternating frames then wedged the GPU. Waits are instrumented via vgl_efbwait_* below. The dst GL texture must already have RGBA8 linear storage of at least w*h. src_y_gl is GL bottom-up; rows are Y-flipped to top-down. Returns 0 on success, <0 if the rect/texture is unusable (fall back to the readback path). Render-thread only (touches GXM).
+int vglCaptureFramebufferRegion(GLuint dst_gl_tex, int src_x, int src_y_gl, int w, int h);
+
+// [FBORT] The FBO analog of vglCaptureFramebufferRegion, for a render-to-FBO frame (MP4 bit27). Ends the IN-USE FBO scene, waits its fragment fence (query_fence), DMA-transfers a rect of the FBO color surface into a GL texture's linear RGBA8 storage, then arms a same-FBO restart at the next draw (needs_scene_reset). Same two-fence discipline as vglCaptureFramebufferRegion (RAW query_fence + capture_tn WAR fence in sceneEnd) and same vgl_efbwait_* instrumentation. Adds per-FBO depth force-STORE at the split + one-shot force-LOAD at the restart so depth survives the mid-frame capture (FBO depth is not display_depth_persist-managed). Unlike the display capture, the fence is pure GPU latency (no display-queue gating) -> ~ms. src_y_gl is GL bottom-up; the source-origin Y-flip yields top-down texture rows (byte-identical sampling to the display capture). Guards: only valid while an FBO is bound (returns -2 on the display surface) and a scene is open (-6). Returns 0 on success, <0 unusable (caller falls back). Render-thread only (touches GXM).
+int vglCaptureFboRegion(GLuint dst_gl_tex, int src_x, int src_y_gl, int w, int h);
+// [EFBCOPY] GPU render-pass copy of the current target's colour (or the display's stored depth) into
+// the colour texture of dst_fbo, through one of the fragment programs registered with
+// vglEfbCopySetPrograms. No CPU wait: the source scene is ended, a copy scene is drawn, and the next draw
+// resumes the source target. u/v: source rect in the source surface's texture space (v = 0 top row).
+// box: 4-tap half-scale box filter. Render-thread only. Returns 0 on success, <0 when unusable.
+int vglEfbCopySetPrograms(const SceGxmProgram *vp, const SceGxmProgram *const *fps, int nfp);
+int vglEfbCopy(GLuint dst_fbo, int fp_index, int src_depth, float u0, float v0, float u1, float v1, int box);
+// [EFBCOPY] The display copy's vertical filter over the finished frame (right before the swap).
+int vglEfbFilterDisplay(GLuint tmp_fbo, int fp_copy, int fp_filter, float row_dv, float w_edge, float w_centre);
+// A caller-built RGBA8 mip chain (level l = (w>>l) x (h>>l), packed rows), laid out like gpu_alloc_mipmaps
+// but CPU-filled: no transfer downscale, no generated levels. Power-of-two sizes. Render-thread only.
+int vglTexImage2DMipChain(GLuint tex_id, int w, int h, int levels, const void *const *rgba);
+// [EFBCOPY] Blended (src-alpha) full-screen passes over the display: programs, then one quad per call
+// sampling tex0 (+ tex1), p0/p1 passed to the program. Render-thread only.
+int vglEfbSetCompositePrograms(const SceGxmProgram *const *fps, int nfp);
+int vglEfbComposite(int fp_index, GLuint tex0, GLuint tex1, float p0, float p1);
+// Runtime switch for the display depth/stencil store (vglEfbCopy depth sources); applies from the next scene.
+void vglSetDisplayDepthStore(GLboolean enable);
+
+// [CAPCOALESCE] TRANSFER-ONLY variant of vglCaptureFboRegion: no scene end, no new fence, no depth store/load arming — just the DMA enqueue (+ a pre-satisfied defensive wait on the last fence). Legal ONLY when the caller can prove the FBO COLOR surface is unchanged since a previous vglCaptureFboRegion's completed fence wait: no draw/clear/blit/RPC-GL executed since (stencil-only scissor updates are fine — they never write color, and their fragment job is TN-fenced behind this transfer at its eventual sceneEnd). For consecutive captures with no intervening color writes (strip/mosaic wipes: dozens of GXCopyTex sub-rects per frame), this collapses N full scene splits (~10ms each: empty-scene end + depth/color store/load + fence) to 1 split + N-1 DMA enqueues. Same return convention as vglCaptureFboRegion (no -6: an open scene is allowed and left open). Render-thread only (touches GXM).
+int vglCaptureFboRegionNoSplit(GLuint dst_gl_tex, int src_x, int src_y_gl, int w, int h);
+
+// [EFB-ASYNC v3] fence-wait instrumentation (microseconds): fn = pre-transfer fragment-fence wait inside vglCaptureFramebufferRegion (the real cost of waiting for the split scene's fragments); tn = pre-EndScene transfer-fence wait inside the scene machinery (~always pre-signaled). Accumulator/max/count each.
+extern uint32_t vgl_efbwait_fn_us, vgl_efbwait_fn_max, vgl_efbwait_fn_cnt;
+extern uint32_t vgl_efbwait_tn_us, vgl_efbwait_tn_max, vgl_efbwait_tn_cnt;
+// [EFB-ASYNC v3.1] FN-wait backlog histogram: index = un-retired scene count when the wait began (clamped to 3). bk[1] = only the pre-capture scene pending (its fill is the cost); bk[2+] = the previous frame's post-capture composite scene also pending (the composite is the hog).
+extern uint32_t vgl_efbwait_bk[4];
+// [EFB-ASYNC v3.2] FN-wait retirement split (accumulators; fn_cnt is the shared count): prev = µs until every OLDER scene retired (previous frame's composite tail), own = remaining µs until the just-submitted pre-capture scene retired.
+extern uint32_t vgl_efbwait_prev_us, vgl_efbwait_own_us;
+
+// [XFERPRESENT] Present the in-use FBO by DMA-copying its color to the display back buffer via the transfer engine — no display scene, no display-gated fragment job (device forensics at the gxm.c definition). Ends the FBO scene, RAW-waits its retirement, transfers, waits the DMA. Returns 0 on success; the caller falls back to the GL-blit present on <0.
+int vglPresentFboTransfer(void);
+
 // Get a GL function name given a function address.
 char *vglGetFuncName(uint32_t func);
 
@@ -1116,6 +1160,9 @@ void vglSetDisplayBufferCount(int count);
 // Setup a callback executed everytime a new frame is sent to the display. Useful to setup a CPU rendered overlay on-screen.
 void vglSetDisplayCallback(void (*cb)(void *framebuf));
 
+// Makes every display scene force-store its depth/stencil at scene end so vglFlushFrame scene splits keep depth continuity (the split's restart one-shot force-loads it back). Must be called before vglInit*. Costs one depth/stencil store per display scene.
+void vglSetDisplayDepthPersistence(GLboolean enable);
+
 // Setup the fragment ring buffer size of sceGxm. Must be called before vglInit*. Default value: SCE_GXM_DEFAULT_FRAGMENT_RING_BUFFER_SIZE.
 void vglSetFragmentBufferSize(uint32_t size);
 
@@ -1161,6 +1208,16 @@ void vglShaderGxpBinary(GLsizei count, const GLuint *handles, const void *binary
 // Perform a display buffer swap. Equivalent of eglSwapBuffers but allows support with Common Dialog.
 void vglSwapBuffers(GLboolean has_commondialog);
 
+// [FSKIP4/FSKIP5] Perform a frame end WITHOUT flipping to display: identical to vglSwapBuffers(GL_FALSE)
+// — scene ended (incl. capture fences), pools/caches rotated and reset, GC kicked — except the rendered
+// frame is never queued for display (no sceGxmDisplayQueueAddEntry; the previous flip keeps showing) and
+// the DISPLAY BUFFER INDICES DO NOT MOVE: the next scene re-renders the same undisplayed back buffer
+// ([FSKIP5]: rotating without flipping consumed buffers faster than flips freed them — structural
+// display-sync starvation on capture scenes; the same-buffer restart is the proven vglFlushFrame /
+// vglSceneSubmit scene-split pattern). Used by the MP4 frameskip on EFB-capture scenes: every tick must
+// DRAW+CAPTURE (feedback correctness) but only every second tick flips (uniform 30fps display).
+void vglSwapBuffersSkipFlip(void);
+
 // Enqueue a request for display resolution change that will happen at next vglSwapBuffers call.
 GLboolean vglSwapResolution(int width, int height);
 
@@ -1181,6 +1238,9 @@ void vglUseVram(GLboolean usage);
 
 // Allows to set a preference on the kind of memory to use for the internal USSE buffers in sceGxm. By default vitaGL will not use VRAM memory.
 void vglUseVramForUSSE(GLboolean usage);
+// Shader patcher bookkeeping: create calls and failures for vertex and fragment programs, and draws skipped for a failed patch.
+void vgl_patcher_stats(uint32_t *vcalls, uint32_t *vfail, uint32_t *fcalls, uint32_t *ffail, uint32_t *skipped);
+uint32_t vgl_patcher_cached(void);   // vertex patches answered from the program's own cached vprog
 
 // Allows vitaGL to use newlib memory once all internal mempools are exhausted. Default value: GL_TRUE.
 void vglUseExtraMem(GLboolean usage);
@@ -1245,8 +1305,152 @@ void vgl_get_draw_phases(unsigned int out[6]);
 //   glDrawElements(mode, count, type, indices);  // skips tex loops
 //   vgl_fast_draw_mode = 0;
 extern int vgl_fast_draw_mode;
+// The program the fast-draw memo holds, 0 when it was reset (scene begin/end,
+// glClear, scissor): the next fast draw of any other program re-aligns its
+// streams from the attribute pointers, so those must be current by then.
+GLuint vgl_fast_draw_last_prog(void);
 SceGxmContext* vglGetGxmContext(void);
 const SceGxmTexture* vglGetGxmTextureById(GLuint gl_tex_id);
+
+// Uniform-image hooks: direct access to the per-program default-uniform-buffer
+// image ("shadow") that the fast-draw upload path memcpys into GXM every draw.
+// Only functional when vitaGL is built WITHOUT UNIFORM_VALUE_CACHE (and without
+// HAVE_FFP_SHADER_SUPPORT); otherwise every call reports failure so callers
+// fall back to glUniform*.
+//   vglPrepareProgramShadow    build the image + offset tables now (idempotent;
+//                              the draw path otherwise does it lazily). 1 = ok.
+//   vglGetProgramShadow        the image for GL_VERTEX_SHADER / GL_FRAGMENT_SHADER
+//                              and its size in bytes; NULL until prepared.
+//   vglGetUniformShadowOffset  byte offset of a uniform location inside its
+//                              stage's image, with its size in bytes, stage and
+//                              SceGxmParameterType; -1 when the uniform is not in
+//                              the image (sampler, or a fixup uniform).
+//   vglMarkShadowDirty         make the next draw re-upload that stage's image.
+// Integer (S32/U32) parameters hold RAW int bits in the image.
+int vglPrepareProgramShadow(GLuint prog);
+void *vglGetProgramShadow(GLuint prog, GLenum stage, uint32_t *size);
+int32_t vglGetUniformShadowOffset(GLuint prog, GLint location, uint32_t *bytes, GLenum *stage, int *paramType);
+void vglMarkShadowDirty(GLenum stage);
+
+// Present-path meters, always on and never logged (unlike HAVE_PROFILING, which prints every 30 frames):
+// running totals the app reads once a frame and turns into per-frame deltas on its own schedule. They say
+// where a slow present waits -- GPU backpressure (end scene, display queue, first begin scene), vsync
+// phase (display queue) or garbage-collector lag -- without draining the GPU to find out. Microsecond
+// fields are u32 and wrap after ~71 minutes: take unsigned differences. Render-thread only, like the rest
+// of vitaGL. The cost is about ten clock reads per frame.
+typedef struct {
+	uint32_t swaps; // vglSwapBuffers calls
+	uint32_t end_scene_us; // sceGxmEndScene, at every scene end (frame ends and mid-frame scene splits)
+	uint32_t end_scenes;
+	uint32_t capture_wait_us; // sceneEnd's wait for a pending capture transfer (the same total as vgl_efbwait_tn_us)
+	uint32_t display_queue_us; // sceGxmDisplayQueueAddEntry: blocks while every display buffer is still queued or on screen
+	uint32_t gc_wait_us; // vglSwapBuffers' wait for the garbage collector to finish the previous purge
+	uint32_t first_begin_us; // the first sceGxmBeginScene after each swap
+	uint32_t begin_us; // every other sceGxmBeginScene (a scene restarted mid-frame)
+	uint32_t begins; // count of those other begins
+	uint32_t scenes_in_flight; // at the time of the call: scenes ended whose fragment work the GPU has not retired yet
+	uint32_t mem_stats_walk_mask; // bit (1 << vglMemType): that pool's vglMemFree fell back to the full chunk walk
+} vglPresentStats;
+void vglGetPresentStats(vglPresentStats *out);
+
+// A GL buffer's storage address, with the buffer marked as used by the frame being built -- what a draw
+// through vitaGL's own path does -- so that a glBufferData or glDeleteBuffers on it during the frames the
+// GPU may still be reading defers the free instead of releasing live memory. For callers that hand buffer
+// storage to sceGxm directly: glMapBuffer/glUnmapBuffer give the same address, but the unmap marks the
+// buffer unused. NULL (and nothing marked) for id 0 or a buffer without storage.
+void *vglBufferPtrStamp(GLuint id);
+
+// ---------------------------------------------------------------------------
+// Fast-draw fast path (Open Nectar). Everything below is off until the application turns it on, and
+// render-thread only like the rest of vitaGL.
+//
+// One interleaved vertex stream. The fast draw path (vgl_fast_draw_mode) patches a program's vertex
+// program from the VAO's attribute configuration, one GXM stream per attribute, whenever the program
+// changes -- an alignment walk, a configuration hash, a patcher lookup and up to eight stream sets. An
+// application whose every vertex is one fixed interleaved struct can describe that struct once:
+//   vglSetFixedVertexLayout  stride and, per GL attribute index 0..7, the byte offset and F32 component
+//                            count inside the struct (stride 0 turns the layout off). Each program is then
+//                            patched ONCE for a single stream with those offsets (the same GXP, the same
+//                            register indices, F32, the same component counts: only the fetch layout
+//                            differs, the bytes fetched are identical), lazily at its first fixed draw
+//                            or when vglFixedLayoutReady asks.
+//   vglFixedLayoutReady      whether a program can take fixed draws: it is patched for the layout now if it
+//                            was not yet (the answer holds for the layout generation). Ask it BEFORE arming
+//                            a draw of the program -- on a program change -- and draw a program that is not
+//                            ready unarmed (the usual path, which reads a constant for a disabled array and
+//                            may still find its own patch in the pool).
+//   vglSetFixedStreamBase    arms the NEXT fast-mode glDrawArrays/glDrawElements with vertex 0's address.
+//                            That draw sets the program's fixed vertex program, uploads uniforms and sets
+//                            stream 0 itself, AFTER the draw's own scene begin. Any draw that was not armed
+//                            (or runs with vgl_fast_draw_mode 0) takes the usual path; an armed draw ignores
+//                            the VAO attribute pointers entirely.
+//   vglFixedDrawEnd          ends an armed draw: disarms (a draw that returned before its shader path --
+//                            fewer vertices than one primitive -- would otherwise leave the base armed for
+//                            the next draw) and returns GL_TRUE when the fixed path REFUSED it (a program
+//                            that is not ready, 32-bit indices, instancing): nothing was drawn and nothing of
+//                            the vertex stage was set, so the caller issues the same draw again unarmed.
+//                            vglFastPathStats.fixed_refused counts refusals; asking vglFixedLayoutReady
+//                            first keeps it at 0.
+//   vglSetVertexStreamCached sceGxmSetVertexStream through vitaGL's draw-state cache: a caller that sets
+//                            streams itself while fixed draws run must use it, or the cache could skip a
+//                            stream set that GXM needs.
+enum {
+	VGL_FIXED_READY = 1,         // patched for the layout: armed draws of it draw
+	VGL_FIXED_OFF = 0,           // no layout set, or no such linked program
+	VGL_FIXED_MISFIT = -1,       // the layout cannot describe it (an attribute outside the eight, a disabled array)
+	VGL_FIXED_PATCH_FAILED = -2  // the shader patcher could not make it (its pools are exhausted)
+};
+void vglSetFixedVertexLayout(uint16_t stride, const uint16_t off[8], const uint8_t comps[8]);
+int vglFixedLayoutReady(GLuint prog);
+void vglSetFixedStreamBase(const void *base);
+GLboolean vglFixedDrawEnd(void);
+void vglSetVertexStreamCached(GLuint index, const void *ptr);
+
+// Versioned uniform uploads. Without them every program change copies both default uniform buffers
+// into the uniform ring again (glUseProgram marks both stages dirty). With them each program keeps its
+// last copy per stage and a version per stage that every write bumps (glUniform*, the shadow-image
+// writes announced with vglMarkProgramShadowDirty); a draw whose program still has an unchanged copy
+// made in the current frame only re-binds it. Copies are reused only within the frame they were made in,
+// so the unfenced ring keeps exactly its present safety margin. selfcheck: every reuse is compared byte
+// for byte against a fresh build of the buffer; the first mismatch turns versioning off for good
+// (vglFastPathStats.unif_check_fails).
+void vglSetUniformVersioning(GLboolean enable, GLboolean selfcheck);
+// The shadow image of one program's stage (vglGetProgramShadow) was written: that stage uploads again
+// at its next draw. vglMarkShadowDirty, which cannot say which program, instead forces every program to
+// copy again.
+void vglMarkProgramShadowDirty(GLuint prog, GLenum stage);
+
+// Fragment-program cache. A program keeps one patched fragment program, for the blend state it was last
+// drawn with; a program drawn alternately with two blend states asked the shader patcher again at every
+// switch. With the cache each program remembers its last four (blend state, float target) patches; the
+// patcher never releases them, so the pointers stay valid. selfcheck: every hit is compared with what the
+// patcher returns for the same key (it deduplicates, so the pointer must be equal); the first mismatch
+// turns the cache off for good (vglFastPathStats.fcache_check_fails).
+void vglSetFragmentProgramCache(GLboolean enable, GLboolean selfcheck);
+
+// Running totals (u32, wrap: take unsigned differences), never reset.
+typedef struct {
+	uint32_t fixed_draws;        // draws that took the fixed one-stream path
+	uint32_t fixed_patches;      // fixed vertex programs patched (at most one per program and layout)
+	uint32_t fixed_fails;        // programs without a fixed vertex program (patch failed or layout misfit), once each
+	uint32_t fixed_refused;      // armed draws the fixed path refused (nothing drawn: vglFixedDrawEnd tells the caller)
+	uint32_t unif_copies[2];     // default uniform buffers copied into the ring (vertex, fragment)
+	uint32_t unif_reuses[2];     // draws that re-bound the program's copy instead
+	uint32_t unif_check_fails;   // versioned-reuse self-check mismatches (versioning is off after the first)
+	uint32_t unif_ring_bytes;    // bytes reserved from the uniform ring
+	uint32_t fcache_hits;        // fragment programs taken from the cache on a blend/target change
+	uint32_t fcache_misses;      // blend/target changes that had to ask the patcher
+	uint32_t fcache_check_fails; // cache self-check mismatches (the cache is off after the first)
+	uint32_t scissor_updates;    // scissor-test mask updates (two fan draws each)
+	uint32_t scene_epoch;        // scenes begun
+	uint8_t unif_versioning;     // the mechanisms as they stand now (a failed self-check clears its flag)
+	uint8_t fcache_enabled;
+	uint8_t fixed_layout;
+	uint8_t pad;
+} vglFastPathStats;
+void vglGetFastPathStats(vglFastPathStats *out);
+// The shader patcher's pool usage right now, in bytes (a patcher query: call it rarely).
+void vglGetPatcherMemory(uint32_t *vertexUsse, uint32_t *fragmentUsse, uint32_t *buffer, uint32_t *host);
 
 #ifdef __cplusplus
 }

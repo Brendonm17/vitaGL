@@ -28,6 +28,7 @@
 
 extern void *vgl_def_frag_buf;
 extern void *vgl_def_vert_buf;
+extern uint32_t vgl_unif_ring_bytes;
 extern SceGxmContext *gxm_context;
 
 void vglSetupUniformCircularPool(void);

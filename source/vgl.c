@@ -153,6 +153,11 @@ void vglUseVram(GLboolean usage) {
 	VGL_MEM_MAIN = usage ? VGL_MEM_VRAM : VGL_MEM_RAM;
 }
 
+uint32_t vgl_patch_vcalls = 0, vgl_patch_vfail = 0, vgl_patch_fcalls = 0, vgl_patch_ffail = 0, vgl_patch_skipped = 0;
+void vgl_patcher_stats(uint32_t *vcalls, uint32_t *vfail, uint32_t *fcalls, uint32_t *ffail, uint32_t *skipped) {
+	*vcalls = vgl_patch_vcalls; *vfail = vgl_patch_vfail; *fcalls = vgl_patch_fcalls; *ffail = vgl_patch_ffail; *skipped = vgl_patch_skipped;
+}
+
 void vglUseVramForUSSE(GLboolean usage) {
 	use_vram_for_usse = usage;
 }

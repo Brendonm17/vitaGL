@@ -222,6 +222,18 @@ extern char vgl_shader_cache_path[256];
 
 extern GLboolean prim_is_non_native; // Flag for when a primitive not supported natively by sceGxm is used
 
+// Line width is GXM context state and sceGxmBeginScene resets it: apply the
+// glLineWidth value at every line draw (after any scene restart), not only
+// when glLineWidth is called.
+extern GLfloat line_width;
+#define VGL_APPLY_LINE_WIDTH() \
+	do { \
+		uint32_t vgl_lw_ = (uint32_t)(line_width + 0.5f); \
+		if (vgl_lw_ < 1) vgl_lw_ = 1; else if (vgl_lw_ > 16) vgl_lw_ = 16; \
+		sceGxmSetFrontPointLineWidth(gxm_context, vgl_lw_); \
+		sceGxmSetBackPointLineWidth(gxm_context, vgl_lw_); \
+	} while (0)
+
 // Translates a GL primitive enum to its sceGxm equivalent
 #ifndef SKIP_ERROR_HANDLING
 #define gl_primitive_to_gxm(x, p, c) \
@@ -241,6 +253,7 @@ extern GLboolean prim_is_non_native; // Flag for when a primitive not supported 
 		p = SCE_GXM_PRIMITIVE_LINES; \
 		sceGxmSetFrontPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
 		sceGxmSetBackPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
+		VGL_APPLY_LINE_WIDTH(); \
 		break; \
 	case GL_LINE_STRIP: \
 		if (c < 2) \
@@ -248,6 +261,7 @@ extern GLboolean prim_is_non_native; // Flag for when a primitive not supported 
 		p = SCE_GXM_PRIMITIVE_LINES; \
 		sceGxmSetFrontPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
 		sceGxmSetBackPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
+		VGL_APPLY_LINE_WIDTH(); \
 		prim_is_non_native = GL_TRUE; \
 		break; \
 	case GL_LINE_LOOP: \
@@ -256,6 +270,7 @@ extern GLboolean prim_is_non_native; // Flag for when a primitive not supported 
 		p = SCE_GXM_PRIMITIVE_LINES; \
 		sceGxmSetFrontPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
 		sceGxmSetBackPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
+		VGL_APPLY_LINE_WIDTH(); \
 		prim_is_non_native = GL_TRUE; \
 		break; \
 	case GL_TRIANGLES: \
@@ -304,17 +319,20 @@ extern GLboolean prim_is_non_native; // Flag for when a primitive not supported 
 		p = SCE_GXM_PRIMITIVE_LINES; \
 		sceGxmSetFrontPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
 		sceGxmSetBackPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
+		VGL_APPLY_LINE_WIDTH(); \
 		break; \
 	case GL_LINE_STRIP: \
 		p = SCE_GXM_PRIMITIVE_LINES; \
 		sceGxmSetFrontPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
 		sceGxmSetBackPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
+		VGL_APPLY_LINE_WIDTH(); \
 		prim_is_non_native = GL_TRUE; \
 		break; \
 	case GL_LINE_LOOP: \
 		p = SCE_GXM_PRIMITIVE_LINES; \
 		sceGxmSetFrontPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
 		sceGxmSetBackPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_LINE); \
+		VGL_APPLY_LINE_WIDTH(); \
 		prim_is_non_native = GL_TRUE; \
 		break; \
 	case GL_TRIANGLES: \
@@ -339,8 +357,12 @@ extern GLboolean prim_is_non_native; // Flag for when a primitive not supported 
 	}
 #endif
 
-// Restore Polygon mode after a draw call
-#ifdef PRIMITIVES_SPEEDHACK
+// Restore Polygon mode after a draw call. Always: with the speedhack this was
+// a no-op, so after a GL_LINES draw the GPU stayed in LINE polygon mode and
+// every triangle drawn after it in the frame came out as wireframe (Open
+// Nectar's save prompt after the day-end graph). The cost is two calls, only
+// after a line or point draw.
+#if 0
 #define restore_polygon_mode(p)
 #else
 #define restore_polygon_mode(p) \
@@ -369,18 +391,41 @@ extern GLboolean prim_is_non_native; // Flag for when a primitive not supported 
 	return y;
 
 #ifdef LOG_ERRORS
+// Every patch is counted and a failed one (the patcher's USSE or buffer
+// memory exhausted: sceGxm returns an error and leaves the output alone)
+// leaves a NULL program, which the draw paths check -- a draw is skipped
+// instead of the GPU running a stale or garbage program.
 #define patchVertexProgram(patcher, id, attr, attr_num, stream, stream_num, prog) \
 	int __v = sceGxmShaderPatcherCreateVertexProgram(patcher, id, attr, attr_num, stream, stream_num, prog); \
-	if (__v) \
-		vgl_log("Vertex shader patching failed (%s) on shader 0x%X with %d attributes and %d streams.\n", get_gxm_error_literal(__v), id, attr_num, stream_num);
+	vgl_patch_vcalls++; \
+	if (__v) { \
+		vgl_patch_vfail++; *(prog) = NULL; \
+		vgl_log("Vertex shader patching failed (%s) on shader 0x%X with %d attributes and %d streams.\n", get_gxm_error_literal(__v), id, attr_num, stream_num); \
+	}
 #define patchFragmentProgram(patcher, id, fmt, msaa_mode, blend_cfg, vertex_link, prog) \
 	int __f = sceGxmShaderPatcherCreateFragmentProgram(patcher, id, fmt, msaa_mode, blend_cfg, vertex_link, prog); \
-	if (__f) \
-		vgl_log("Fragment shader patching failed (%s) on shader 0x%X.\n", get_gxm_error_literal(__f), id);
+	vgl_patch_fcalls++; \
+	if (__f) { \
+		vgl_patch_ffail++; *(prog) = NULL; \
+		vgl_log("Fragment shader patching failed (%s) on shader 0x%X.\n", get_gxm_error_literal(__f), id); \
+	}
 #else
-#define patchVertexProgram sceGxmShaderPatcherCreateVertexProgram
-#define patchFragmentProgram sceGxmShaderPatcherCreateFragmentProgram
+#define patchVertexProgram(patcher, id, attr, attr_num, stream, stream_num, prog) \
+	int __v = sceGxmShaderPatcherCreateVertexProgram(patcher, id, attr, attr_num, stream, stream_num, prog); \
+	vgl_patch_vcalls++; \
+	if (__v) { vgl_patch_vfail++; *(prog) = NULL; }
+#define patchFragmentProgram(patcher, id, fmt, msaa_mode, blend_cfg, vertex_link, prog) \
+	int __f = sceGxmShaderPatcherCreateFragmentProgram(patcher, id, fmt, msaa_mode, blend_cfg, vertex_link, prog); \
+	vgl_patch_fcalls++; \
+	if (__f) { vgl_patch_ffail++; *(prog) = NULL; }
 #endif
+extern uint32_t vgl_patch_vcalls, vgl_patch_vfail, vgl_patch_fcalls, vgl_patch_ffail, vgl_patch_skipped;
+// Open Nectar fast path (custom_shaders.c, vitaGL.h vglSetUniformVersioning): a scene begin unbinds the
+// default uniform buffers, so sceneReset marks both stages' bindings stale and counts the scene; the
+// scissor-test mask updates are counted in tests.c.
+extern GLboolean vgl_unif_bind_stale[2];
+extern uint32_t vgl_scene_epoch;
+extern uint32_t vgl_scissor_updates;
 
 #define recalculate_normal_matrix() \
 	matrix3x3 inverted; \

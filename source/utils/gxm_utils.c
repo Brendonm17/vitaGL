@@ -22,12 +22,35 @@
  */
 #include "../shared.h"
 
-#define UNIFORM_CIRCULAR_POOL_SIZE (2 * 1024 * 1024)
+// flat ring, no GPU fence on wrap: must hold more than (frames-in-flight + 1)
+// frames of uniforms or the wrap overwrites data the GPU is still reading
+// (wrong-color flashes, worse under MSAA where the GPU lags further).
+// [MP4-TEXFIX test 2026-07-24] 8MB starved the VGL_MEM_RAM pool -> texture allocs
+// failed -> white untextured surfaces (party-mode chars/bg). Revert to 2MB to confirm.
+// Every draw's vertex AND fragment default uniform buffer is carved from this
+// pool (vglReserveVertexUniformBuffer / vglReserveFragmentUniformBuffer), and
+// the wrap below has NO GPU FENCE -- it just rewinds to the start. So the pool
+// must be larger than the uniforms consumed by every frame the GPU still has
+// in flight, or a wrap overwrites uniforms a queued draw has not read yet.
+//
+// Open Nectar hit exactly that: ~718 draws x ~2.7KB = ~2MB per frame wrapped
+// this 2MB pool about once per frame, silently (the outage warning below only
+// fires if it wraps TWICE in one frame), corrupting whichever tiles the GPU
+// rasterised after the wrap -- garbage pinned to one side of the screen and
+// different every frame. Raising it is the fix; sceGxmFinish per frame also
+// cured it but cost half the frame rate.
+//
+// 16MB covers ~8 frames at the title and ~4 in heavier scenes, comfortably
+// past displayQueueMaxPendingCount (= display buffers - 1).
+#define UNIFORM_CIRCULAR_POOL_SIZE (16 * 1024 * 1024)
 
 void *vgl_def_frag_buf = NULL;
 void *vgl_def_vert_buf = NULL;
 static uint8_t *unif_pool = NULL;
 static uint32_t unif_idx = 0;
+// Running total of the bytes handed out (vglGetFastPathStats): the per-frame
+// consumption says how close a frame comes to lapping the fenceless ring.
+uint32_t vgl_unif_ring_bytes = 0;
 
 void vglSetupUniformCircularPool() {
 	unif_pool = gpu_alloc_mapped(UNIFORM_CIRCULAR_POOL_SIZE, VGL_MEM_RAM);
@@ -35,6 +58,7 @@ void vglSetupUniformCircularPool() {
 
 void *vglReserveUniformCircularPoolBuffer(uint32_t size) {
 	void *r;
+	vgl_unif_ring_bytes += size;
 	if (unif_idx + size >= UNIFORM_CIRCULAR_POOL_SIZE) {
 #ifndef SKIP_ERROR_HANDLING
 		static uint32_t last_frame_swap = 0;

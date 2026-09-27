@@ -252,8 +252,12 @@ inline __attribute__((always_inline)) void update_alpha_test_settings() {
 		alpha_op = ALWAYS;
 }
 
+// Mask updates run (vglGetFastPathStats): each is one or two full fan draws of its own.
+uint32_t vgl_scissor_updates = 0;
+
 void update_scissor_test() {
 	const float scissor_depth = 1.0f;
+	vgl_scissor_updates++;
 
 	// Setting current vertex program to clear screen one and fragment program to scissor test one
 	sceGxmSetVertexProgram(gxm_context, clear_vertex_program_patched);

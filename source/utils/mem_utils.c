@@ -29,6 +29,25 @@ GLboolean has_cached_mem = GL_FALSE; // Flag for whether to use cached memory fo
 
 #ifndef HAVE_CUSTOM_HEAP
 static void *mempool_mspace[VGL_MEM_ALL] = {NULL, NULL, NULL, NULL, NULL}; // mspace creations (VRAM, RAM, PHYCONT RAM, CDLG, EXTERNAL)
+
+// Free-space queries (vglMemFree). sceClibMspaceMallocStats is presumably dlmalloc's malloc_stats, a
+// walk over every chunk of the pool -- every texture and buffer, from uncached memory for VRAM -- which an
+// app asking once a frame pays every frame; sceClibMspaceMallocStatsFast presumably reads running totals
+// instead. Neither is documented, so the fast answer is checked against the full walk on every query
+// while a pool warms up and on every MEM_STATS_CHECK_EVERY-th after that. The pool is not still while
+// that happens: vglSwapBuffers ends by starting the garbage collector, which vgl_frees the purged
+// frame's storage on another core, so a check runs next to a purge that can free megabytes between two
+// reads. A check is therefore fast read, walk, fast read again, and it fails only when the walk lands
+// more than MEM_STATS_TOLERANCE outside both fast reads (frees only shrink the pool, so a truthful fast
+// total brackets the walk) or a capacity differs. MEM_STATS_STRIKES failed checks in a row send the pool
+// back to the full walk for good, and vglGetPresentStats says so; one clean check clears the count.
+#define MEM_STATS_WARMUP 1024
+#define MEM_STATS_CHECK_EVERY 64
+#define MEM_STATS_TOLERANCE (256 * 1024)
+#define MEM_STATS_STRIKES 3
+static uint8_t mem_stats_walk[VGL_MEM_ALL]; // 1 = this pool is on the full walk
+static uint8_t mem_stats_strikes[VGL_MEM_ALL]; // failed checks in a row
+static uint32_t mem_stats_queries[VGL_MEM_ALL];
 #endif
 static void *mempool_addr[VGL_MEM_ALL] = {NULL, NULL, NULL, NULL, NULL}; // addresses of heap memblocks (VRAM, RAM, PHYCONT RAM, CDLG, EXTERNAL)
 static SceUID mempool_id[VGL_MEM_ALL] = {0, 0, 0, 0, 0}; // UIDs of heap memblocks (VRAM, RAM, PHYCONT RAM, EXTERNAL)
@@ -459,12 +478,46 @@ size_t vgl_mem_get_free_space(vglMemType type) {
 	}
 #else
 	} else if (mempool_size[type]) {
-		SceClibMspaceStats stats;
-		sceClibMspaceMallocStats(mempool_mspace[type], &stats);
+		// Zeroed so a field the undocumented fast call might leave unwritten never answers from stack
+		// garbage (a check would catch a zero capacity and send the pool back to the walk).
+		SceClibMspaceStats stats = {0};
+		if (mem_stats_walk[type]) {
+			sceClibMspaceMallocStats(mempool_mspace[type], &stats);
+		} else {
+			sceClibMspaceMallocStatsFast(mempool_mspace[type], &stats);
+			const uint32_t q = mem_stats_queries[type]++;
+			if (q < MEM_STATS_WARMUP || (q % MEM_STATS_CHECK_EVERY) == 0) {
+				SceClibMspaceStats full = {0}, after = {0};
+				sceClibMspaceMallocStats(mempool_mspace[type], &full);
+				sceClibMspaceMallocStatsFast(mempool_mspace[type], &after);
+				// The garbage collector may free between the reads, so the walk is held against the span
+				// of the two fast reads around it, widened by the tolerance, not against one of them.
+				const size_t lo = stats.current_in_use < after.current_in_use ? stats.current_in_use : after.current_in_use;
+				const size_t hi = stats.current_in_use < after.current_in_use ? after.current_in_use : stats.current_in_use;
+				const int agrees = full.capacity == stats.capacity && full.capacity == after.capacity &&
+				                   full.current_in_use + MEM_STATS_TOLERANCE >= lo && full.current_in_use <= hi + MEM_STATS_TOLERANCE;
+				if (agrees)
+					mem_stats_strikes[type] = 0;
+				else if (++mem_stats_strikes[type] >= MEM_STATS_STRIKES)
+					mem_stats_walk[type] = 1;
+				stats = full; // a checked query answers from the walk either way
+			}
+		}
 		return stats.capacity - stats.current_in_use;
 	} else
 		return 0;
 #endif
+}
+
+uint32_t vgl_mem_stats_walk_mask(void) {
+	uint32_t mask = 0;
+#ifndef HAVE_CUSTOM_HEAP
+	for (int i = 0; i < VGL_MEM_ALL; i++) {
+		if (mem_stats_walk[i])
+			mask |= 1u << i;
+	}
+#endif
+	return mask;
 }
 
 size_t vgl_mem_get_total_space(vglMemType type) {

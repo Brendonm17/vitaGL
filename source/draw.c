@@ -209,8 +209,8 @@ void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
 	}
 #endif
 	SceGxmPrimitiveType gxm_p;
+	sceneReset(); // first: a scene (re)start resets GXM polygon mode and line width, which the macro sets
 	gl_primitive_to_gxm(mode, gxm_p, count);
-	sceneReset();
 	GLboolean is_draw_legal = GL_TRUE;
 
 	if (cur_program != 0)
@@ -221,9 +221,10 @@ void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
 		_glDrawArrays_FixedFunctionIMPL(first, count);
 	}
 
-#ifndef SKIP_ERROR_HANDLING
+	// Honoured in every build: the custom-shader path refuses a draw whose
+	// vertex or fragment patch failed, and the draw must then not be issued
+	// (NO_DEBUG used to compile this test out and draw with a NULL program).
 	if (is_draw_legal)
-#endif
 	{
 		uint16_t *ptr;
 		switch (mode) {
@@ -325,13 +326,14 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei prim
 	}
 #endif
 	SceGxmPrimitiveType gxm_p;
+	sceneReset(); // first: a scene (re)start resets GXM polygon mode and line width, which the macro sets
 	gl_primitive_to_gxm(mode, gxm_p, count);
-	sceneReset();
 	GLboolean is_draw_legal = _glDrawArrays_CustomShadersIMPL(first, count, GL_TRUE);
 
-#ifndef SKIP_ERROR_HANDLING
+	// Honoured in every build: the custom-shader path refuses a draw whose
+	// vertex or fragment patch failed, and the draw must then not be issued
+	// (NO_DEBUG used to compile this test out and draw with a NULL program).
 	if (is_draw_legal)
-#endif
 	{
 		uint16_t *ptr;
 		switch (mode) {
@@ -382,8 +384,8 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
 #endif
 
 	SceGxmPrimitiveType gxm_p;
+	sceneReset(); // first: a scene (re)start resets GXM polygon mode and line width, which the macro sets
 	gl_primitive_to_gxm(mode, gxm_p, count);
-	sceneReset();
 	GLboolean is_draw_legal = GL_TRUE;
 
 	gpubuffer *gpu_buf = (gpubuffer *)cur_vao->index_array_unit;
@@ -407,9 +409,10 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
 		_glDrawElements_FixedFunctionIMPL(src, count, 0, 0, type != GL_UNSIGNED_INT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);
 	}
 
-#ifndef SKIP_ERROR_HANDLING
+	// Honoured in every build: the custom-shader path refuses a draw whose
+	// vertex or fragment patch failed, and the draw must then not be issued
+	// (NO_DEBUG used to compile this test out and draw with a NULL program).
 	if (is_draw_legal)
-#endif
 	{
 		if (type == GL_UNSIGNED_SHORT) {
 			setup_elements_indices(uint16_t);
@@ -437,8 +440,8 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const GLv
 #endif
 
 	SceGxmPrimitiveType gxm_p;
+	sceneReset(); // first: a scene (re)start resets GXM polygon mode and line width, which the macro sets
 	gl_primitive_to_gxm(mode, gxm_p, count);
-	sceneReset();
 	GLboolean is_draw_legal = GL_TRUE;
 
 	gpubuffer *gpu_buf = (gpubuffer *)cur_vao->index_array_unit;
@@ -451,9 +454,10 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const GLv
 		_glDrawElements_FixedFunctionIMPL(src, count, 0, baseVertex, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);
 	}
 
-#ifndef SKIP_ERROR_HANDLING
+	// Honoured in every build: the custom-shader path refuses a draw whose
+	// vertex or fragment patch failed, and the draw must then not be issued
+	// (NO_DEBUG used to compile this test out and draw with a NULL program).
 	if (is_draw_legal)
-#endif
 	{
 #ifdef HAVE_VITA3K_SUPPORT
 		if (type == GL_UNSIGNED_INT) {
@@ -494,8 +498,8 @@ void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, G
 #endif
 
 	SceGxmPrimitiveType gxm_p;
+	sceneReset(); // first: a scene (re)start resets GXM polygon mode and line width, which the macro sets
 	gl_primitive_to_gxm(mode, gxm_p, count);
-	sceneReset();
 	GLboolean is_draw_legal = GL_TRUE;
 
 	gpubuffer *gpu_buf = (gpubuffer *)cur_vao->index_array_unit;
@@ -508,9 +512,10 @@ void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, G
 		_glDrawElements_FixedFunctionIMPL(src, count, end + 1, 0, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);
 	}
 
-#ifndef SKIP_ERROR_HANDLING
+	// Honoured in every build: the custom-shader path refuses a draw whose
+	// vertex or fragment patch failed, and the draw must then not be issued
+	// (NO_DEBUG used to compile this test out and draw with a NULL program).
 	if (is_draw_legal)
-#endif
 	{
 		if (type == GL_UNSIGNED_INT) {
 			setup_elements_indices(uint32_t);
@@ -537,8 +542,8 @@ void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsize
 #endif
 
 	SceGxmPrimitiveType gxm_p;
+	sceneReset(); // first: a scene (re)start resets GXM polygon mode and line width, which the macro sets
 	gl_primitive_to_gxm(mode, gxm_p, count);
-	sceneReset();
 	GLboolean is_draw_legal = GL_TRUE;
 
 	gpubuffer *gpu_buf = (gpubuffer *)cur_vao->index_array_unit;
@@ -551,9 +556,10 @@ void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsize
 		_glDrawElements_FixedFunctionIMPL(src, count, end + baseVertex + 1, baseVertex, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);
 	}
 
-#ifndef SKIP_ERROR_HANDLING
+	// Honoured in every build: the custom-shader path refuses a draw whose
+	// vertex or fragment patch failed, and the draw must then not be issued
+	// (NO_DEBUG used to compile this test out and draw with a NULL program).
 	if (is_draw_legal)
-#endif
 	{
 #ifdef HAVE_VITA3K_SUPPORT
 		if (type == GL_UNSIGNED_INT) {
@@ -594,16 +600,17 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
 #endif
 
 	SceGxmPrimitiveType gxm_p;
+	sceneReset(); // first: a scene (re)start resets GXM polygon mode and line width, which the macro sets
 	gl_primitive_to_gxm(mode, gxm_p, count);
-	sceneReset();
 
 	gpubuffer *gpu_buf = (gpubuffer *)cur_vao->index_array_unit;
 	uint16_t *src = gpu_buf ? (uint16_t *)((uint8_t *)gpu_buf->ptr + (uint32_t)gl_indices) : (uint16_t *)gl_indices;
 	GLboolean is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, 0, 0, type == GL_UNSIGNED_SHORT ? SCE_GXM_INDEX_SOURCE_INSTANCE_16BIT : SCE_GXM_INDEX_SOURCE_INSTANCE_32BIT);
 
-#ifndef SKIP_ERROR_HANDLING
+	// Honoured in every build: the custom-shader path refuses a draw whose
+	// vertex or fragment patch failed, and the draw must then not be issued
+	// (NO_DEBUG used to compile this test out and draw with a NULL program).
 	if (is_draw_legal)
-#endif
 	{
 		if (type == GL_UNSIGNED_INT) {
 			setup_elements_indices(uint32_t);
@@ -629,8 +636,8 @@ void vglDrawObjects(GLenum mode, GLsizei count, GLboolean implicit_wvp) {
 #endif
 
 	SceGxmPrimitiveType gxm_p;
+	sceneReset(); // first: a scene (re)start resets GXM polygon mode and line width, which the macro sets
 	gl_primitive_to_gxm(mode, gxm_p, count);
-	sceneReset();
 
 	texture_unit *tex_unit = &texture_units[0];
 	if (cur_program != 0) {

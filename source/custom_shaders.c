@@ -28,6 +28,131 @@
 // when set, _glDrawElements_CustomShadersIMPL skips the texture loops
 // and lets the caller set textures directly.
 int vgl_fast_draw_mode = 0;
+// The program the last fast-mode draw (arrays or elements) aligned its
+// attributes and streams for: a following fast draw with the same program
+// skips the alignment (the caller sets the streams itself).
+static GLuint vgl_last_fast_prog = 0;
+// The program the memo holds (0 after any reset): a caller that feeds the
+// vertex streams itself can see whether the next fast draw will re-align
+// them from the attribute pointers, and refresh those first.
+GLuint vgl_fast_draw_last_prog(void) { return vgl_last_fast_prog; }
+// sceGxmShaderPatcherCreateVertexProgram returns the one patched program for
+// identical parameters (it deduplicates and reference-counts), so a program
+// drawn again with the same attribute/stream configuration keeps the vprog
+// it has instead of asking the patcher every draw (1.1 million asks in one
+// Open Nectar session: ~300 a frame, each a patcher hash + lookup).
+uint32_t vgl_patch_cached = 0;
+uint32_t vgl_patcher_cached(void) { return vgl_patch_cached; }
+
+// ---------------------------------------------------------------------------
+// Open Nectar fast path (vitaGL.h: vglSetFixedVertexLayout, vglSetUniformVersioning,
+// vglSetFragmentProgramCache). Every switch starts off, so a program that never
+// asks for them runs exactly the code it always did.
+//
+// The fixed layout: one interleaved vertex struct, described once. A program is
+// patched for it the first time an armed draw uses it (vgl_get_fixed_vprog) and
+// keeps that vertex program for as long as the layout generation holds.
+static struct {
+	uint16_t stride;
+	uint16_t off[VERTEX_ATTRIBS_NUM];
+	uint8_t comps[VERTEX_ATTRIBS_NUM];
+	uint32_t gen;         // bumped by every vglSetFixedVertexLayout: a program patched for an older one patches again
+	GLboolean enabled;
+} vgl_fixed;
+// Vertex 0 of the next fast draw (NULL: not armed). Taken and cleared at the top
+// of the draw's shader path. A draw that returns before it (gl_primitive_to_gxm:
+// fewer vertices than one primitive) leaves it armed, so the caller ends every
+// armed draw with vglFixedDrawEnd, which disarms.
+static const void *vgl_fixed_base = NULL;
+// The armed draw was refused by the fixed path (vgl_draw_fixed): nothing was
+// drawn, and vglFixedDrawEnd tells the caller so that it can issue the same draw
+// through the usual path. Cleared by arming and by vglFixedDrawEnd.
+static GLboolean vgl_fixed_refused = GL_FALSE;
+// Versioned uniform uploads. vgl_unif_gen invalidates every program's copy at
+// once (vglMarkShadowDirty, which cannot name a program; sampler sizes shared by
+// every program of a fragment shader); a scene begin unbinds the default uniform
+// buffers, which vgl_unif_bind_stale remembers per stage.
+static GLboolean vgl_unif_versioning = GL_FALSE;
+static GLboolean vgl_unif_check = GL_FALSE;
+static uint32_t vgl_unif_gen = 1;
+GLboolean vgl_unif_bind_stale[2] = { GL_TRUE, GL_TRUE };
+uint32_t vgl_scene_epoch = 0;
+// The fragment-program cache.
+static GLboolean vgl_fcache_enabled = GL_FALSE;
+static GLboolean vgl_fcache_check = GL_FALSE;
+static vglFastPathStats vgl_fp_stats;
+
+void vglSetFixedVertexLayout(uint16_t stride, const uint16_t off[8], const uint8_t comps[8]) {
+	vgl_fixed.gen++;
+	vgl_fixed_base = NULL;
+	if (!stride || !off || !comps) {
+		vgl_fixed.enabled = GL_FALSE;
+		return;
+	}
+	vgl_fixed.stride = stride;
+	for (int i = 0; i < VERTEX_ATTRIBS_NUM; i++) {
+		vgl_fixed.off[i] = i < 8 ? off[i] : 0;
+		vgl_fixed.comps[i] = i < 8 ? comps[i] : 0;
+	}
+	vgl_fixed.enabled = GL_TRUE;
+}
+
+void vglSetFixedStreamBase(const void *base) {
+	vgl_fixed_base = vgl_fixed.enabled ? base : NULL;
+	vgl_fixed_refused = GL_FALSE;
+}
+
+GLboolean vglFixedDrawEnd(void) {
+	const GLboolean refused = vgl_fixed_refused;
+	vgl_fixed_base = NULL;
+	vgl_fixed_refused = GL_FALSE;
+	return refused;
+}
+
+void vglSetUniformVersioning(GLboolean enable, GLboolean selfcheck) {
+	vgl_unif_versioning = enable ? GL_TRUE : GL_FALSE;
+	vgl_unif_check = (enable && selfcheck) ? GL_TRUE : GL_FALSE;
+	// Whatever was copied under the other mode is not trusted across the switch:
+	// every program copies again, and the dirty flags make the unversioned path
+	// do the same.
+	vgl_unif_gen++;
+	dirty_vert_unifs = GL_TRUE;
+	dirty_frag_unifs = GL_TRUE;
+}
+
+void vglSetFragmentProgramCache(GLboolean enable, GLboolean selfcheck) {
+	vgl_fcache_enabled = enable ? GL_TRUE : GL_FALSE;
+	vgl_fcache_check = (enable && selfcheck) ? GL_TRUE : GL_FALSE;
+}
+
+void vglGetPatcherMemory(uint32_t *vertexUsse, uint32_t *fragmentUsse, uint32_t *buffer, uint32_t *host) {
+	if (vertexUsse) *vertexUsse = gxm_shader_patcher ? sceGxmShaderPatcherGetVertexUsseMemAllocated(gxm_shader_patcher) : 0;
+	if (fragmentUsse) *fragmentUsse = gxm_shader_patcher ? sceGxmShaderPatcherGetFragmentUsseMemAllocated(gxm_shader_patcher) : 0;
+	if (buffer) *buffer = gxm_shader_patcher ? sceGxmShaderPatcherGetBufferMemAllocated(gxm_shader_patcher) : 0;
+	if (host) *host = gxm_shader_patcher ? sceGxmShaderPatcherGetHostMemAllocated(gxm_shader_patcher) : 0;
+}
+
+void vglGetFastPathStats(vglFastPathStats *out) {
+	if (!out)
+		return;
+	*out = vgl_fp_stats;
+	out->unif_ring_bytes = vgl_unif_ring_bytes;
+	out->scissor_updates = vgl_scissor_updates;
+	out->scene_epoch = vgl_scene_epoch;
+	out->unif_versioning = vgl_unif_versioning ? 1 : 0;
+	out->fcache_enabled = vgl_fcache_enabled ? 1 : 0;
+	out->fixed_layout = vgl_fixed.enabled ? 1 : 0;
+	out->pad = 0;
+}
+static inline uint32_t vgl_vprog_cfg_hash(const SceGxmVertexAttribute *a, const SceGxmVertexStream *st, GLuint num) {
+	uint32_t h = 2166136261u;
+	const uint8_t *b = (const uint8_t *)a;
+	for (uint32_t i = 0; i < num * sizeof(SceGxmVertexAttribute); i++) { h ^= b[i]; h *= 16777619u; }
+	b = (const uint8_t *)st;
+	for (uint32_t i = 0; i < num * sizeof(SceGxmVertexStream); i++) { h ^= b[i]; h *= 16777619u; }
+	h ^= num;
+	return h;
+}
 
 SceGxmContext* vglGetGxmContext(void) {
     return gxm_context;
@@ -54,8 +179,14 @@ char vgl_file_cache_path[256];
 #endif
 #endif
 
-#define MAX_CUSTOM_SHADERS 2048 // Maximum number of linkable custom shaders
-#define MAX_CUSTOM_PROGRAMS 1024 // Maximum number of linkable custom programs
+#define MAX_CUSTOM_SHADERS 4096 // Maximum number of linkable custom shaders (Open Nectar: ~2.7k baked; 1972 B each)
+#define MAX_CUSTOM_PROGRAMS 16384 // Maximum number of linkable custom programs (Open Nectar: TEV x vertex-variant pair programs; bake 18 = 9.2k)
+// 2048 was not enough once the testers' shader captures were baked in.
+// Open Nectar links, at boot: 4 fallbacks + one program per TEV config +
+// one per (config, vertex-variant) pair. At 564 configs and 1676 pairs that
+// is 2244. With SKIP_ERROR_HANDLING (the fast build) glCreateProgram does
+// not return 0 when it runs out -- res stays 0xFFFFFFFF and the caller
+// indexes progs[] with it, which is a data abort, on boot.
 
 #define setDefaultAttribBindings() \
 	uint32_t cnt = sceGxmProgramGetParameterCount(p->vshader->prog); \
@@ -206,6 +337,16 @@ char vgl_file_cache_path[256];
 			uint32_t _val; __builtin_memcpy(&_val, _probe + _b, 4); \
 			if (_val == _mbits) { _found = (int32_t)_b; break; } \
 		} \
+		/* S32/U32 parameters: sceGxmSetUniformDataF converts the 1.0f marker to */ \
+		/* the integer 1, so the float bit pattern is never found and the uniform */ \
+		/* fell to the fixup path (and every int uniform stayed off the image). */ \
+		/* The probe buffer is zeroed, so the lone 1 word IS the parameter. */ \
+		if (_found < 0) { \
+			for (uint32_t _b = 0; _b + 3 < (buf_size); _b += 4) { \
+				uint32_t _val; __builtin_memcpy(&_val, _probe + _b, 4); \
+				if (_val == 1u) { _found = (int32_t)_b; break; } \
+			} \
+		} \
 		(out_offsets)[_z] = _found; \
 	} \
 	free(_probe); \
@@ -241,6 +382,19 @@ char vgl_file_cache_path[256];
 			__builtin_memcpy(_new, _old, (unis)[_z].size * sizeof(float)); \
 			vgl_free(_old); \
 			(unis)[_z].data = _new; \
+			/* The image is bulk-copied into GXM with no conversion, so an S32/U32 */ \
+			/* parameter must hold raw int bits from now on: convert what the */ \
+			/* float-storing glUniform*i wrote so far, and flag it for future writes. */ \
+			{ \
+				SceGxmParameterType _pt = sceGxmProgramParameterGetType((unis)[_z].ptr); \
+				(unis)[_z].raw_int = (_pt == SCE_GXM_PARAMETER_TYPE_S32 || _pt == SCE_GXM_PARAMETER_TYPE_U32) ? GL_TRUE : GL_FALSE; \
+				if ((unis)[_z].raw_int) { \
+					for (uint32_t _k = 0; _k < (unis)[_z].size; _k++) { \
+						float _fv = _new[_k]; \
+						((int32_t *)_new)[_k] = (int32_t)_fv; \
+					} \
+				} \
+			} \
 		} else { \
 			/* scan starts at _off+4 to skip stray zeros in elem 0. */ \
 			uint32_t _stride = 0; \
@@ -279,74 +433,11 @@ char vgl_file_cache_path[256];
 		(void)(fixup_meta); (void)(offsets); \
 	} while(0)
 
-#define uploadUniforms() \
-	if (p->vert_uniforms && dirty_vert_unifs) { \
-		if (vgl_fast_draw_mode && p->vert_uniforms_num > 0) { \
-			if (!p->vert_uniform_offsets) { \
-				_VGL_PROBE_OFFSETS(p->vert_uniforms, p->vert_uniforms_num, \
-					p->vshader->unif_buf_size, p->vert_uniform_offsets); \
-				p->vert_shadow = calloc(1, p->vshader->unif_buf_size); \
-				_VGL_REDIRECT_AND_BUILD_FIXUP(p->vert_uniforms, p->vert_uniforms_num, \
-					p->vert_shadow, p->vert_uniform_offsets, \
-					p->vert_fixup_list, p->vert_fixup_meta, p->vert_fixup_count, p->vert_shadow_used, \
-					p->vshader->unif_buf_size); \
-			} \
-			_FAST_UPLOAD_UNIFORMS(p->vert_uniforms, \
-				p->vert_shadow, p->vert_uniform_offsets, \
-				p->vert_fixup_list, p->vert_fixup_meta, p->vert_fixup_count, \
-				p->vshader->unif_buf_size, vglReserveVertexUniformBuffer); \
-		} else { \
-			void *buffer = vglReserveVertexUniformBuffer(p->vshader->unif_buf_size); \
-			for (int z = 0; z < p->vert_uniforms_num; z++) { \
-				uniform *u = &p->vert_uniforms[z]; \
-				if (u->size > 0 && u->size < 0xFFFFFFFF) \
-					sceGxmSetUniformDataF(buffer, u->ptr, 0, u->size, u->data); \
-			} \
-		} \
-		dirty_vert_unifs = GL_FALSE; \
-	} \
-	if (p->frag_uniforms && dirty_frag_unifs) { \
-		if (vgl_fast_draw_mode && p->frag_uniforms_num > 0) { \
-			if (!p->frag_uniform_offsets) { \
-				_VGL_PROBE_OFFSETS(p->frag_uniforms, p->frag_uniforms_num, \
-					p->fshader->unif_buf_size, p->frag_uniform_offsets); \
-				p->frag_shadow = calloc(1, p->fshader->unif_buf_size); \
-				_VGL_REDIRECT_AND_BUILD_FIXUP(p->frag_uniforms, p->frag_uniforms_num, \
-					p->frag_shadow, p->frag_uniform_offsets, \
-					p->frag_fixup_list, p->frag_fixup_meta, p->frag_fixup_count, p->frag_shadow_used, \
-					p->fshader->unif_buf_size); \
-			} \
-			_FAST_UPLOAD_UNIFORMS(p->frag_uniforms, \
-				p->frag_shadow, p->frag_uniform_offsets, \
-				p->frag_fixup_list, p->frag_fixup_meta, p->frag_fixup_count, \
-				p->fshader->unif_buf_size, vglReserveFragmentUniformBuffer); \
-		} else { \
-			void *buffer = vglReserveFragmentUniformBuffer(p->fshader->unif_buf_size); \
-			for (int z = 0; z < p->frag_uniforms_num; z++) { \
-				uniform *u = &p->frag_uniforms[z]; \
-				if (u->size > 0 && u->size < 0xFFFFFFFF) \
-					sceGxmSetUniformDataF(buffer, u->ptr, 0, u->size, u->data); \
-			} \
-		} \
-		dirty_frag_unifs = GL_FALSE; \
-	} \
-	if (p->vert_ubos) { \
-		ubo *u = p->vert_ubos; \
-		while (u) { \
-			ubo *b = u->alias ? u->alias : u; \
-			sceGxmSetVertexUniformBuffer(gxm_context, b->idx, (uint8_t *)ubo_buf[b->bind]->ptr + ubo_offset[b->bind]); \
-			ubo_buf[b->bind]->last_frame = vgl_framecount; \
-			u = (ubo *)u->chain; \
-		} \
-	} \
-	if (p->frag_ubos) { \
-		ubo *u = p->frag_ubos; \
-		while (u) { \
-			sceGxmSetFragmentUniformBuffer(gxm_context, u->idx, (uint8_t *)ubo_buf[u->bind]->ptr + ubo_offset[u->bind]); \
-			ubo_buf[u->bind]->last_frame = vgl_framecount; \
-			u = (ubo *)u->chain; \
-		} \
-	}
+// The body is vgl_upload_uniforms (defined with the uniform-image hooks below,
+// once the program struct exists): the same two uploads, gated either by the
+// global dirty flags as before or, with vglSetUniformVersioning, by the
+// program's own per-stage versions.
+#define uploadUniforms() vgl_upload_uniforms(p)
 #endif // UNIFORM_VALUE_CACHE
 #else
 #define uploadUniforms() \
@@ -408,12 +499,23 @@ char vgl_file_cache_path[256];
 	}
 #endif
 	
-#define setupFragProgram() \
+// The program's fragment program for the current blend state and target
+// (vgl_select_frag_program: the patcher, or the program's fragment-program cache).
+#define setupFragProgramSelect() \
 	if ((p->blend_info.raw != blend_info.raw) || (is_fbo_float != p->is_fbo_float)) { \
 		p->is_fbo_float = is_fbo_float; \
 		p->blend_info.raw = blend_info.raw; \
-		rebuild_frag_shader(p->fshader->id, &p->fprog, (SceGxmProgram *)p->vshader->prog, is_fbo_float ? SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4); \
-	} \
+		vgl_select_frag_program(p); \
+	}
+#define setupFragProgram() \
+	setupFragProgramSelect() \
+	VGL_SET_FPROG(p->fprog);
+// For the draws that return a verdict: a failed patch leaves p->fprog NULL, and
+// the draw is refused BEFORE that NULL reaches GXM (it used to be set first, and
+// a NO_DEBUG draw.c ignored the verdict, so the draw ran anyway).
+#define setupFragProgramOrSkip() \
+	setupFragProgramSelect() \
+	if (!p->fprog) { vgl_patch_skipped++; return GL_FALSE; } \
 	VGL_SET_FPROG(p->fprog);
 	
 #define alignAttributes(attributes, streams) \
@@ -489,6 +591,7 @@ static SceGxmVertexProgram *last_vprog_cache;
 static SceGxmFragmentProgram *last_fprog_cache;
 
 void vgl_draw_state_cache_reset(void) {
+    vgl_last_fast_prog = 0;   // the fast-draw memo too: the programs are about to be set by someone else
     for (int i = 0; i < 16; i++) { last_frag_tex_cache[i] = NULL; last_vert_tex_cache[i] = NULL; }
     for (int i = 0; i < VERTEX_ATTRIBS_NUM; i++) last_vstream_cache[i] = NULL;
     last_vprog_cache = NULL;
@@ -498,6 +601,9 @@ void vgl_draw_state_cache_reset(void) {
 // for callers that set v/f programs directly (glClear, scissor test);
 // leaves the texture and vstream caches alone.
 void vgl_draw_state_cache_invalidate_programs(void) {
+    // glClear / the scissor test set vertex and fragment programs directly:
+    // the next fast-mode draw must set its own again, not trust the memo.
+    vgl_last_fast_prog = 0;
     last_vprog_cache = NULL;
     last_fprog_cache = NULL;
 }
@@ -583,6 +689,8 @@ typedef struct {
 #endif
 	GLboolean is_fragment;
 	GLboolean is_vertex;
+	GLboolean raw_int; // data holds raw S32/U32 register bits: the uniform lives in the bulk-copied shadow image
+	GLuint owner; // the program (1-based) whose uniform arrays hold this entry: a write bumps that program's uniform versions
 #ifdef UNIFORM_VALUE_CACHE
 	float *last_data;
 #endif
@@ -625,6 +733,8 @@ typedef struct {
 	SceGxmVertexStream stream[VERTEX_ATTRIBS_NUM];
 	uint8_t attr_map[VERTEX_ATTRIBS_NUM];
 	SceGxmVertexProgram *vprog;
+	uint32_t vprog_cfg_hash;      // the attribute/stream configuration vprog was patched for
+	GLboolean vprog_cfg_valid;
 	SceGxmFragmentProgram *fprog;
 	blend_config blend_info;
 	GLuint attr_num;
@@ -667,6 +777,25 @@ typedef struct {
 	void *last_vert_buf;
 	void *last_frag_buf;
 #endif
+	// Open Nectar fast path (see vglSetFixedVertexLayout, vglSetUniformVersioning,
+	// vglSetFragmentProgramCache). All of it is inert until the application turns
+	// the mechanism on.
+	SceGxmVertexProgram *vprog_fixed; // this program patched for the one-stream fixed layout
+	uint32_t vprog_fixed_gen;         // the layout generation vprog_fixed was patched for (0: never; a NULL
+	                                  // vprog_fixed with the current generation is a patch that failed)
+	int8_t vprog_fixed_verdict;       // why, for that generation: VGL_FIXED_READY / _MISFIT / _PATCH_FAILED
+	struct vgl_fcache_s {
+		uint32_t raw;                 // blend_info.raw the fragment program was patched for
+		GLboolean fbo_float;          // is_fbo_float it was patched for
+		SceGxmFragmentProgram *fp;    // NULL: empty entry
+	} fcache[4];
+	uint8_t fcache_next;              // round-robin replacement slot
+	uint32_t unif_ver[2];             // bumped by every write to the stage's values (vertex, fragment)
+	uint32_t gpu_ver[2];              // unif_ver when gpu_buf was last filled
+	uint32_t gpu_frame[2];            // vgl_framecount when gpu_buf was last filled
+	uint32_t gpu_gen[2];              // vgl_unif_gen when gpu_buf was last filled
+	void *gpu_buf[2];                 // the stage's last default uniform buffer in the ring (NULL: none)
+	GLboolean gpu_shadow[2];          // gpu_buf was built from the shadow image (byte-comparable by the self-check)
 } program;
 
 // Internal shaders and array
@@ -698,6 +827,486 @@ static inline __attribute__((always_inline)) uniform *getUniformFromPtr(GLint pt
 #else
 #define getUniformFromPtr(ptr, offs) (-ptr)
 #endif
+
+// ---------------------------------------------------------------------------
+// Uniform-image hooks (Open Nectar).
+//
+// The fast-draw uniform path keeps, per program, a byte image of the default
+// uniform buffer ("shadow") that every draw memcpys into the reserved GXM
+// buffer. A client that prepares its uniform values on another thread can
+// write straight into that image instead of issuing one glUniform* call per
+// value: it asks once, at init, where each location lives in the image
+// (vglGetUniformShadowOffset), and later memcpys changed byte ranges into the
+// image (vglGetProgramShadow) and marks the stage dirty (vglMarkShadowDirty).
+//
+// Only meaningful in the fast-upload configuration (no UNIFORM_VALUE_CACHE, no
+// FFP shader support); the other builds return failure and the caller falls
+// back to per-uniform calls.
+//
+// Integer parameters: the image holds RAW register contents, so a client that
+// writes an S32/U32 parameter must store int bits, not (float)v as glUniform1i
+// does. sceGxmSetUniformDataF converts float->int for those parameters, the
+// bulk memcpy path does not, which is why uploadUniforms also bulk-copies
+// (never runs the converting loop) once a program has a shadow.
+#if !defined(HAVE_FFP_SHADER_SUPPORT) && !defined(UNIFORM_VALUE_CACHE)
+static void vgl_prepare_program_shadow(program *p) {
+	// The values move into the images (ints to raw bits): a copy made before
+	// this is not reused after it (vglSetUniformVersioning).
+	p->unif_ver[0]++;
+	p->unif_ver[1]++;
+	if (p->vert_uniforms && p->vert_uniforms_num > 0 && !p->vert_uniform_offsets && p->vshader && p->vshader->unif_buf_size > 0) {
+		_VGL_PROBE_OFFSETS(p->vert_uniforms, p->vert_uniforms_num,
+			p->vshader->unif_buf_size, p->vert_uniform_offsets);
+		p->vert_shadow = calloc(1, p->vshader->unif_buf_size);
+		_VGL_REDIRECT_AND_BUILD_FIXUP(p->vert_uniforms, p->vert_uniforms_num,
+			p->vert_shadow, p->vert_uniform_offsets,
+			p->vert_fixup_list, p->vert_fixup_meta, p->vert_fixup_count, p->vert_shadow_used,
+			p->vshader->unif_buf_size);
+	}
+	if (p->frag_uniforms && p->frag_uniforms_num > 0 && !p->frag_uniform_offsets && p->fshader && p->fshader->unif_buf_size > 0) {
+		_VGL_PROBE_OFFSETS(p->frag_uniforms, p->frag_uniforms_num,
+			p->fshader->unif_buf_size, p->frag_uniform_offsets);
+		p->frag_shadow = calloc(1, p->fshader->unif_buf_size);
+		_VGL_REDIRECT_AND_BUILD_FIXUP(p->frag_uniforms, p->frag_uniforms_num,
+			p->frag_shadow, p->frag_uniform_offsets,
+			p->frag_fixup_list, p->frag_fixup_meta, p->frag_fixup_count, p->frag_shadow_used,
+			p->fshader->unif_buf_size);
+	}
+}
+
+int vglPrepareProgramShadow(GLuint prog) {
+	if (prog == 0 || prog > MAX_CUSTOM_PROGRAMS)
+		return 0;
+	program *p = &progs[prog - 1];
+	if (p->status != PROG_LINKED)
+		return 0;
+	vgl_prepare_program_shadow(p);
+	return 1;
+}
+
+void *vglGetProgramShadow(GLuint prog, GLenum stage, uint32_t *size) {
+	if (prog == 0 || prog > MAX_CUSTOM_PROGRAMS) {
+		if (size) *size = 0;
+		return NULL;
+	}
+	program *p = &progs[prog - 1];
+	if (stage == GL_VERTEX_SHADER) {
+		if (size) *size = p->vshader ? p->vshader->unif_buf_size : 0;
+		return p->vert_shadow;
+	}
+	if (size) *size = p->fshader ? p->fshader->unif_buf_size : 0;
+	return p->frag_shadow;
+}
+
+int32_t vglGetUniformShadowOffset(GLuint prog, GLint location, uint32_t *bytes, GLenum *stage, int *paramType) {
+	if (location == -1 || location == 0 || prog == 0 || prog > MAX_CUSTOM_PROGRAMS)
+		return -1;
+	program *p = &progs[prog - 1];
+	int offs = 0;
+	uniform *u = (uniform *)getUniformFromPtr(location, &offs);
+	(void)offs;
+	if (!u || u->size == 0 || u->size == 0xFFFFFFFF) // sampler
+		return -1;
+	uint8_t *base;
+	uint32_t sz;
+	if (u->is_vertex) {
+		base = (uint8_t *)p->vert_shadow;
+		sz = p->vshader ? p->vshader->unif_buf_size : 0;
+		if (stage) *stage = GL_VERTEX_SHADER;
+	} else {
+		base = (uint8_t *)p->frag_shadow;
+		sz = p->fshader ? p->fshader->unif_buf_size : 0;
+		if (stage) *stage = GL_FRAGMENT_SHADER;
+	}
+	uint8_t *d = (uint8_t *)u->data;
+	if (!base || d < base || d + u->size * sizeof(float) > base + sz)
+		return -1; // a fixup uniform: lives outside the image
+	if (bytes) *bytes = u->size * sizeof(float);
+	if (paramType) *paramType = (int)sceGxmProgramParameterGetType(u->ptr);
+	return (int32_t)(d - base);
+}
+
+void vglMarkShadowDirty(GLenum stage) {
+	if (stage == GL_VERTEX_SHADER)
+		dirty_vert_unifs = GL_TRUE;
+	else
+		dirty_frag_unifs = GL_TRUE;
+	// It does not say whose image was written: no program's copy is reused.
+	vgl_unif_gen++;
+}
+
+void vglMarkProgramShadowDirty(GLuint prog, GLenum stage) {
+	// Exactly vglMarkShadowDirty for the unversioned path...
+	if (stage == GL_VERTEX_SHADER)
+		dirty_vert_unifs = GL_TRUE;
+	else
+		dirty_frag_unifs = GL_TRUE;
+	// ...and the written program's own version for the versioned one.
+	if (prog == 0 || prog > MAX_CUSTOM_PROGRAMS)
+		vgl_unif_gen++;
+	else
+		progs[prog - 1].unif_ver[stage == GL_VERTEX_SHADER ? 0 : 1]++;
+}
+
+// Versioned uniform uploads (vglSetUniformVersioning).
+//
+// Every draw used to copy both default uniform buffers into the uniform ring
+// whenever the global dirty flags said so, and glUseProgram raises both: a
+// frame that switches between a handful of programs re-copied the same, unchanged
+// images hundreds of times. A program now remembers, per stage, its last copy in
+// the ring (gpu_buf), the stage's version when it was made (gpu_ver), the frame
+// (gpu_frame) and the global generation (gpu_gen). A draw may re-bind that copy
+// instead of making a new one when all four still hold:
+//   - the version: every write to the stage's values bumps unif_ver -- glUniform*
+//     (VGL_UNIF_BUMP: both stages, as a vertex and a fragment uniform of the same
+//     name share their data), vglMarkProgramShadowDirty, shadow preparation;
+//   - the frame: the ring has no GPU fence, so a copy is reused only within the
+//     frame that made it -- the same lifetime a copy has today;
+//   - the generation: writes that cannot name their program (vglMarkShadowDirty,
+//     sampler sizes shared by a fragment shader's programs) and switching the
+//     mode itself invalidate every copy at once;
+//   - how it was built: a copy made per uniform (a program drawn without its
+//     image) is not reused where the image would be copied now.
+// Re-binding is skipped only when the stage's binding is known to be that copy:
+// vgl_def_*_buf always names what was bound last (glClear and the scissor test
+// restore exactly that after their own reservations), and a scene begin, which
+// unbinds everything, raises vgl_unif_bind_stale.
+static inline GLboolean vgl_unif_image_path(program *p, int s) {
+	return (vgl_fast_draw_mode || (s ? p->frag_uniform_offsets : p->vert_uniform_offsets) != NULL) &&
+		(s ? p->frag_uniforms_num : p->vert_uniforms_num) > 0;
+}
+
+// unifcheck: rebuild what a copy would hold now and compare it with the copy
+// about to be reused. Only image-built copies are byte-comparable (a per-uniform
+// copy keeps the ring's old bytes between its parameters).
+static GLboolean vgl_unif_copy_matches(program *p, int s) {
+	static uint8_t *scratch = NULL;
+	static uint32_t scratch_size = 0;
+	if (!p->gpu_shadow[s])
+		return GL_TRUE;
+	const uint8_t *shadow = (const uint8_t *)(s ? p->frag_shadow : p->vert_shadow);
+	const uint32_t size = s ? p->fshader->unif_buf_size : p->vshader->unif_buf_size;
+	if (!shadow || !size)
+		return GL_TRUE;
+	if (scratch_size < size) {
+		free(scratch);
+		scratch = (uint8_t *)malloc(size);
+		scratch_size = scratch ? size : 0;
+		if (!scratch)
+			return GL_TRUE;
+	}
+	uniform *unis = s ? p->frag_uniforms : p->vert_uniforms;
+	const uint16_t *list = s ? p->frag_fixup_list : p->vert_fixup_list;
+	const uint32_t count = s ? p->frag_fixup_count : p->vert_fixup_count;
+	__builtin_memcpy(scratch, shadow, size);
+	for (uint32_t f = 0; f < count; f++) {
+		uniform *u = &unis[list[f]];
+		sceGxmSetUniformDataF(scratch, u->ptr, 0, u->size, u->data);
+	}
+	return __builtin_memcmp(scratch, p->gpu_buf[s], size) == 0 ? GL_TRUE : GL_FALSE;
+}
+
+// The stage's existing copy, re-bound, instead of a new one. False: copy.
+static inline GLboolean vgl_unif_reuse(program *p, int s) {
+	if (!p->gpu_buf[s] || p->gpu_ver[s] != p->unif_ver[s] || p->gpu_frame[s] != vgl_framecount ||
+		p->gpu_gen[s] != vgl_unif_gen || p->gpu_shadow[s] != vgl_unif_image_path(p, s))
+		return GL_FALSE;
+	if (vgl_unif_check && !vgl_unif_copy_matches(p, s)) {
+		// A write that bumped no version: versioning is off for the rest of the
+		// run (the application reports vglFastPathStats.unif_check_fails), and
+		// everything uploads again the unversioned way.
+		vgl_fp_stats.unif_check_fails++;
+		vgl_unif_versioning = GL_FALSE;
+		vgl_unif_gen++;
+		dirty_vert_unifs = GL_TRUE;
+		dirty_frag_unifs = GL_TRUE;
+		return GL_FALSE;
+	}
+	if (s == 0) {
+		if (vgl_def_vert_buf != p->gpu_buf[0] || vgl_unif_bind_stale[0]) {
+			vgl_def_vert_buf = p->gpu_buf[0];
+			sceGxmSetVertexDefaultUniformBuffer(gxm_context, vgl_def_vert_buf);
+			vgl_unif_bind_stale[0] = GL_FALSE;
+		}
+		dirty_vert_unifs = GL_FALSE;
+	} else {
+		if (vgl_def_frag_buf != p->gpu_buf[1] || vgl_unif_bind_stale[1]) {
+			vgl_def_frag_buf = p->gpu_buf[1];
+			sceGxmSetFragmentDefaultUniformBuffer(gxm_context, vgl_def_frag_buf);
+			vgl_unif_bind_stale[1] = GL_FALSE;
+		}
+		dirty_frag_unifs = GL_FALSE;
+	}
+	vgl_fp_stats.unif_reuses[s]++;
+	return GL_TRUE;
+}
+
+// A copy was just made (and bound by its reservation).
+static inline void vgl_unif_note_copy(program *p, int s, void *buf, GLboolean from_image) {
+	vgl_fp_stats.unif_copies[s]++;
+	if (!vgl_unif_versioning)
+		return;
+	p->gpu_buf[s] = buf;
+	p->gpu_ver[s] = p->unif_ver[s];
+	p->gpu_frame[s] = vgl_framecount;
+	p->gpu_gen[s] = vgl_unif_gen;
+	p->gpu_shadow[s] = from_image;
+	vgl_unif_bind_stale[s] = GL_FALSE;
+}
+
+// uploadUniforms() in this configuration: the same two uploads as before (the
+// image, bulk-copied with its fixups, or per uniform for a program drawn without
+// one), each gated by the global dirty flag or, versioned, by vgl_unif_reuse.
+static void vgl_upload_uniforms(program *p) {
+	if (p->vert_uniforms && (vgl_unif_versioning ? !vgl_unif_reuse(p, 0) : dirty_vert_unifs)) {
+		const GLboolean from_image = vgl_unif_image_path(p, 0);
+		if (from_image) {
+			if (!p->vert_uniform_offsets) {
+				_VGL_PROBE_OFFSETS(p->vert_uniforms, p->vert_uniforms_num,
+					p->vshader->unif_buf_size, p->vert_uniform_offsets);
+				p->vert_shadow = calloc(1, p->vshader->unif_buf_size);
+				_VGL_REDIRECT_AND_BUILD_FIXUP(p->vert_uniforms, p->vert_uniforms_num,
+					p->vert_shadow, p->vert_uniform_offsets,
+					p->vert_fixup_list, p->vert_fixup_meta, p->vert_fixup_count, p->vert_shadow_used,
+					p->vshader->unif_buf_size);
+				vgl_log("[VGL UNIF] VERTEX prog %d: buf %u B, %d uniforms, %u FIXUPS/draw\n",
+					(int)cur_program, (unsigned)p->vshader->unif_buf_size,
+					(int)p->vert_uniforms_num, (unsigned)p->vert_fixup_count);
+				p->unif_ver[0]++;
+				p->unif_ver[1]++;
+			}
+			_FAST_UPLOAD_UNIFORMS(p->vert_uniforms,
+				p->vert_shadow, p->vert_uniform_offsets,
+				p->vert_fixup_list, p->vert_fixup_meta, p->vert_fixup_count,
+				p->vshader->unif_buf_size, vglReserveVertexUniformBuffer);
+		} else {
+			void *buffer = vglReserveVertexUniformBuffer(p->vshader->unif_buf_size);
+			for (int z = 0; z < p->vert_uniforms_num; z++) {
+				uniform *u = &p->vert_uniforms[z];
+				if (u->size > 0 && u->size < 0xFFFFFFFF)
+					sceGxmSetUniformDataF(buffer, u->ptr, 0, u->size, u->data);
+			}
+		}
+		vgl_unif_note_copy(p, 0, vgl_def_vert_buf, from_image);
+		dirty_vert_unifs = GL_FALSE;
+	}
+	if (p->frag_uniforms && (vgl_unif_versioning ? !vgl_unif_reuse(p, 1) : dirty_frag_unifs)) {
+		const GLboolean from_image = vgl_unif_image_path(p, 1);
+		if (from_image) {
+			if (!p->frag_uniform_offsets) {
+				_VGL_PROBE_OFFSETS(p->frag_uniforms, p->frag_uniforms_num,
+					p->fshader->unif_buf_size, p->frag_uniform_offsets);
+				p->frag_shadow = calloc(1, p->fshader->unif_buf_size);
+				_VGL_REDIRECT_AND_BUILD_FIXUP(p->frag_uniforms, p->frag_uniforms_num,
+					p->frag_shadow, p->frag_uniform_offsets,
+					p->frag_fixup_list, p->frag_fixup_meta, p->frag_fixup_count, p->frag_shadow_used,
+					p->fshader->unif_buf_size);
+				vgl_log("[VGL UNIF] FRAG prog %d: buf %u B, %d uniforms, %u FIXUPS/draw\n",
+					(int)cur_program, (unsigned)p->fshader->unif_buf_size,
+					(int)p->frag_uniforms_num, (unsigned)p->frag_fixup_count);
+				p->unif_ver[0]++;
+				p->unif_ver[1]++;
+			}
+			_FAST_UPLOAD_UNIFORMS(p->frag_uniforms,
+				p->frag_shadow, p->frag_uniform_offsets,
+				p->frag_fixup_list, p->frag_fixup_meta, p->frag_fixup_count,
+				p->fshader->unif_buf_size, vglReserveFragmentUniformBuffer);
+		} else {
+			void *buffer = vglReserveFragmentUniformBuffer(p->fshader->unif_buf_size);
+			for (int z = 0; z < p->frag_uniforms_num; z++) {
+				uniform *u = &p->frag_uniforms[z];
+				if (u->size > 0 && u->size < 0xFFFFFFFF)
+					sceGxmSetUniformDataF(buffer, u->ptr, 0, u->size, u->data);
+			}
+		}
+		vgl_unif_note_copy(p, 1, vgl_def_frag_buf, from_image);
+		dirty_frag_unifs = GL_FALSE;
+	}
+	if (p->vert_ubos) {
+		ubo *u = p->vert_ubos;
+		while (u) {
+			ubo *b = u->alias ? u->alias : u;
+			sceGxmSetVertexUniformBuffer(gxm_context, b->idx, (uint8_t *)ubo_buf[b->bind]->ptr + ubo_offset[b->bind]);
+			ubo_buf[b->bind]->last_frame = vgl_framecount;
+			u = (ubo *)u->chain;
+		}
+	}
+	if (p->frag_ubos) {
+		ubo *u = p->frag_ubos;
+		while (u) {
+			sceGxmSetFragmentUniformBuffer(gxm_context, u->idx, (uint8_t *)ubo_buf[u->bind]->ptr + ubo_offset[u->bind]);
+			ubo_buf[u->bind]->last_frame = vgl_framecount;
+			u = (ubo *)u->chain;
+		}
+	}
+}
+#else
+int vglPrepareProgramShadow(GLuint prog) { (void)prog; return 0; }
+void *vglGetProgramShadow(GLuint prog, GLenum stage, uint32_t *size) { (void)prog; (void)stage; if (size) *size = 0; return NULL; }
+int32_t vglGetUniformShadowOffset(GLuint prog, GLint location, uint32_t *bytes, GLenum *stage, int *paramType) {
+	(void)prog; (void)location; (void)bytes; (void)stage; (void)paramType; return -1;
+}
+void vglMarkShadowDirty(GLenum stage) { (void)stage; }
+void vglMarkProgramShadowDirty(GLuint prog, GLenum stage) { (void)prog; (void)stage; }
+#endif
+
+// A write to one of the program's uniform values (glUniform*): both stages'
+// versions move, because a vertex and a fragment uniform of the same name share
+// one data array (getUniformAliasDataPtr).
+#define VGL_UNIF_BUMP(u) do { \
+	if ((u)->owner) { \
+		program *_bp = &progs[(u)->owner - 1]; \
+		_bp->unif_ver[0]++; \
+		_bp->unif_ver[1]++; \
+	} \
+} while (0)
+
+// The fixed one-stream layout (vglSetFixedVertexLayout).
+//
+// The program's vertex program for it, patched once per layout generation: for
+// every attribute the program has -- presence comes from attr_map/attr_num,
+// exactly the attributes the usual path patches -- stream 0, the struct offset,
+// F32, the struct's component count, the program's own register. The usual path
+// fetches the same bytes through one stream per attribute (stride = the struct,
+// offset 0, each stream based at vertex 0 + that offset); only the fetch layout
+// differs. The patcher deduplicates, so programs sharing a vertex shader share
+// one. A program with no attributes at all is patched as the usual path patches
+// it, with no attribute and no stream. NULL when it cannot be built -- an
+// attribute outside the eight the layout describes, or a disabled array (the
+// usual path would read a constant there): VGL_FIXED_MISFIT -- or when the patch
+// failed (the patcher's pools exhausted): VGL_FIXED_PATCH_FAILED. Either verdict
+// is remembered for the layout generation (fixed_fails counts the program once),
+// and the application is expected to have asked vglFixedLayoutReady before
+// arming a draw of it, so that its draws take the usual path instead.
+static SceGxmVertexProgram *vgl_get_fixed_vprog(program *p) {
+	if (p->vprog_fixed_gen == vgl_fixed.gen)
+		return p->vprog_fixed;
+	p->vprog_fixed_gen = vgl_fixed.gen;
+	p->vprog_fixed = NULL;
+	p->vprog_fixed_verdict = VGL_FIXED_MISFIT;
+	SceGxmVertexAttribute attrs[VERTEX_ATTRIBS_NUM];
+	GLboolean ok = vgl_fixed.enabled && p->vshader && p->attr_num <= 8;
+	for (GLuint i = 0; ok && i < p->attr_num; i++) {
+		const uint8_t a = p->attr_map[i];
+		if (a >= 8 || !vgl_fixed.comps[a] || p->attr[a].regIndex == 0xDEAD || !(cur_vao->vertex_attrib_state & (1 << a))) {
+			ok = GL_FALSE;
+			break;
+		}
+		attrs[i].streamIndex = 0;
+		attrs[i].offset = vgl_fixed.off[a];
+		attrs[i].format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+		attrs[i].componentCount = vgl_fixed.comps[a];
+		attrs[i].regIndex = p->attr[a].regIndex;
+	}
+	if (!ok) {
+		vgl_fp_stats.fixed_fails++;
+		return NULL;
+	}
+	SceGxmVertexStream stream;
+	stream.stride = vgl_fixed.stride;
+	stream.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
+	{
+		patchVertexProgram(gxm_shader_patcher, p->vshader->id, attrs, p->attr_num, &stream, p->attr_num ? 1 : 0, &p->vprog_fixed);
+	}
+	vgl_fp_stats.fixed_patches++;
+	if (!p->vprog_fixed) {
+		p->vprog_fixed_verdict = VGL_FIXED_PATCH_FAILED;
+		vgl_fp_stats.fixed_fails++;
+	} else {
+		p->vprog_fixed_verdict = VGL_FIXED_READY;
+	}
+	return p->vprog_fixed;
+}
+
+int vglFixedLayoutReady(GLuint prog) {
+	if (!vgl_fixed.enabled || prog == 0 || prog > MAX_CUSTOM_PROGRAMS)
+		return VGL_FIXED_OFF;
+	program *p = &progs[prog - 1];
+	if (p->status != PROG_LINKED || !p->vshader)
+		return VGL_FIXED_OFF;
+	vgl_get_fixed_vprog(p);
+	return p->vprog_fixed_verdict;
+}
+
+// An armed fast draw (vglSetFixedStreamBase): the fixed vertex program, the
+// uniforms, stream 0 at vertex 0 -- all set here, after the draw's own scene
+// begin, through the draw-state cache. What it replaces is the usual fast path's
+// program-change branch (alignment walk, configuration hash, patch lookup, one
+// stream set per attribute) and its same-program memo; the texture handling
+// before it is untouched. The memo is cleared because GXM now holds the fixed
+// program: an unarmed fast draw of this program afterwards must align and patch
+// its own again (a caller that feeds streams itself sees vgl_fast_draw_last_prog 0).
+// The fixed vertex program sources its vertices by plain 16-bit index; a draw
+// that needs anything else (32-bit indices, instancing), or a program without a
+// fixed vertex program, is refused, not approximated: nothing is drawn, nothing
+// of the vertex stage is set, and vglFixedDrawEnd reports it (fixed_refused), so
+// the caller issues the same draw again unarmed -- the usual path, exactly.
+static GLboolean vgl_draw_fixed(program *p, const void *base, GLboolean index16) {
+	vgl_last_fast_prog = 0;
+	SceGxmVertexProgram *vp = index16 ? vgl_get_fixed_vprog(p) : NULL;
+	if (!vp) {
+		vgl_fixed_refused = GL_TRUE;
+		vgl_fp_stats.fixed_refused++;
+		return GL_FALSE;
+	}
+	VGL_SET_VPROG(vp);
+	uploadUniforms();
+	if (p->attr_num)
+		VGL_SET_VSTREAM(0, base);
+	vgl_fp_stats.fixed_draws++;
+	return GL_TRUE;
+}
+
+void vglSetVertexStreamCached(GLuint index, const void *ptr) {
+	VGL_SET_VSTREAM(index, ptr);
+}
+
+// The program's fragment program for its (just updated) blend state and target:
+// from the program's fragment-program cache when vglSetFragmentProgramCache is
+// on and it holds the key, from the patcher otherwise. The patcher's key is
+// (fragment shader, output format, multisample mode, blend info, vertex link);
+// the shaders and the link are the program's own and the multisample mode is
+// fixed at init, so (blend info, float target) is the whole of what varies.
+// Patched programs are never released, so a cached pointer stays valid.
+static void vgl_select_frag_program(program *p) {
+	const SceGxmOutputRegisterFormat fmt = is_fbo_float ? SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4;
+	if (vgl_fcache_enabled) {
+		for (int k = 0; k < 4; k++) {
+			struct vgl_fcache_s *e = &p->fcache[k];
+			if (!e->fp || e->raw != p->blend_info.raw || e->fbo_float != p->is_fbo_float)
+				continue;
+			if (vgl_fcache_check) {
+				// The patcher returns its existing program for a key it has seen:
+				// the same pointer, or the cache is wrong (then it is off for good).
+				// A NULL answer is a full pool, not a verdict on the cache.
+				SceGxmFragmentProgram *chk = NULL;
+				{
+					rebuild_frag_shader(p->fshader->id, &chk, (SceGxmProgram *)p->vshader->prog, fmt);
+				}
+				if (chk && chk != e->fp) {
+					vgl_fp_stats.fcache_check_fails++;
+					vgl_fcache_enabled = GL_FALSE;
+					p->fprog = chk;
+					return;
+				}
+			}
+			p->fprog = e->fp;
+			vgl_fp_stats.fcache_hits++;
+			return;
+		}
+		vgl_fp_stats.fcache_misses++;
+	}
+	{
+		rebuild_frag_shader(p->fshader->id, &p->fprog, (SceGxmProgram *)p->vshader->prog, fmt);
+	}
+	if (vgl_fcache_enabled && p->fprog) {
+		struct vgl_fcache_s *e = &p->fcache[p->fcache_next];
+		e->raw = p->blend_info.raw;
+		e->fbo_float = p->is_fbo_float;
+		e->fp = p->fprog;
+		p->fcache_next = (uint8_t)((p->fcache_next + 1) & 3);
+	}
+}
 
 void release_shader(shader *s) {
 	// Deallocating shader and unregistering it from sceGxmShaderPatcher
@@ -1050,6 +1659,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 				info->sizes[0] = sceGxmTextureGetWidth(&tex->gxm_tex);
 				info->sizes[1] = sceGxmTextureGetHeight(&tex->gxm_tex);
 				dirty_frag_unifs = GL_TRUE;
+				vgl_unif_gen++;   // shared by every program of this fragment shader
 			}
 #endif
 #ifndef SAMPLERS_SPEEDHACK
@@ -1176,7 +1786,19 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 #endif
 
 	// Uploading new vertex program
-	patchVertexProgram(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
+	{
+		const uint32_t _cfg = vgl_vprog_cfg_hash(attributes, streams, p->attr_num);
+		if (p->vprog && p->vprog_cfg_valid && p->vprog_cfg_hash == _cfg) {
+			vgl_patch_cached++;
+		} else {
+			patchVertexProgram(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
+			p->vprog_cfg_hash = _cfg; p->vprog_cfg_valid = p->vprog != NULL;
+		}
+	}
+	// The patch failed: no draw on a NULL program. The fast-draw memo already names
+	// this program, and would send its next draw straight to the uniforms with
+	// whatever vertex program GXM holds: forget it, so that draw patches (or fails) again.
+	if (!p->vprog) { vgl_patch_skipped++; vgl_last_fast_prog = 0; return GL_FALSE; }
 	VGL_SET_VPROG(p->vprog);
 
 	// Uploading both fragment and vertex uniforms data
@@ -1215,9 +1837,14 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 	uint32_t draw_start = sceKernelGetProcessTimeLow();
 #endif
 	program *p = &progs[cur_program - 1];
+	// The vertex base the caller armed for exactly this draw (vglSetFixedStreamBase),
+	// taken now so that it cannot outlive the draw whatever happens below.
+	const void *fixed_base = vgl_fixed_base;
+	vgl_fixed_base = NULL;
 
 	// Check if a blend info rebuild is required and upload fragment program
-	setupFragProgram();
+	// (the patch failed: no draw, and no NULL program set)
+	setupFragProgramOrSkip();
 
 	// Uploading fragment textures on relative texture units
 	for (int i = 0; i < p->max_frag_texunit_idx; i++) {
@@ -1267,6 +1894,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 				info->sizes[0] = sceGxmTextureGetWidth(&tex->gxm_tex);
 				info->sizes[1] = sceGxmTextureGetHeight(&tex->gxm_tex);
 				dirty_frag_unifs = GL_TRUE;
+				vgl_unif_gen++;   // shared by every program of this fragment shader
 			}
 #endif
 #ifndef SAMPLERS_SPEEDHACK
@@ -1316,6 +1944,23 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 #endif
 	}
 
+	// same-shader fast path (as in the elements path): vprog/attribs/vstreams
+	// persist from the previous draw, jump straight to uniform upload. Without
+	// this an array draw re-aligned the streams from the VAO pointers every
+	// time, and a caller that refreshes those only on a program change (Open
+	// Nectar's render thread) had the GPU read from a stale base -- past the
+	// ring on a large draw: the GPU crash in the boss fight.
+	if (vgl_fast_draw_mode) {
+		// An armed draw: one stream, the fixed layout (vgl_draw_fixed). Vertex
+		// `first` is where the usual path's streams would start.
+		if (fixed_base)
+			return vgl_draw_fixed(p, (const uint8_t *)fixed_base + (uint32_t)first * vgl_fixed.stride, !instanced);
+		if (cur_program == vgl_last_fast_prog) {
+			uploadUniforms();
+			return GL_TRUE;
+		}
+		vgl_last_fast_prog = cur_program;
+	}
 	// Aligning attributes
 	SceGxmVertexAttribute *attributes;
 	SceGxmVertexStream *streams;
@@ -1417,7 +2062,19 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 #endif
 
 	// Uploading new vertex program
-	patchVertexProgram(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
+	{
+		const uint32_t _cfg = vgl_vprog_cfg_hash(attributes, streams, p->attr_num);
+		if (p->vprog && p->vprog_cfg_valid && p->vprog_cfg_hash == _cfg) {
+			vgl_patch_cached++;
+		} else {
+			patchVertexProgram(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
+			p->vprog_cfg_hash = _cfg; p->vprog_cfg_valid = p->vprog != NULL;
+		}
+	}
+	// The patch failed: no draw on a NULL program. The fast-draw memo already names
+	// this program, and would send its next draw straight to the uniforms with
+	// whatever vertex program GXM holds: forget it, so that draw patches (or fails) again.
+	if (!p->vprog) { vgl_patch_skipped++; vgl_last_fast_prog = 0; return GL_FALSE; }
 	VGL_SET_VPROG(p->vprog);
 
 	// Uploading both fragment and vertex uniforms data
@@ -1461,9 +2118,14 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 	uint32_t draw_start = sceKernelGetProcessTimeLow();
 #endif
 	program *p = &progs[cur_program - 1];
+	// The vertex base the caller armed for exactly this draw (vglSetFixedStreamBase),
+	// taken now so that it cannot outlive the draw whatever happens below.
+	const void *fixed_base = vgl_fixed_base;
+	vgl_fixed_base = NULL;
 
 	// Check if a blend info rebuild is required and upload fragment program
-	setupFragProgram();
+	// (the patch failed: no draw, and no NULL program set)
+	setupFragProgramOrSkip();
 
 	// (skipped in vgl_fast_draw_mode; caller sets textures directly.)
 	PHASE_BEGIN(FRAG_TEX);
@@ -1515,6 +2177,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 				info->sizes[0] = sceGxmTextureGetWidth(&tex->gxm_tex);
 				info->sizes[1] = sceGxmTextureGetHeight(&tex->gxm_tex);
 				dirty_frag_unifs = GL_TRUE;
+				vgl_unif_gen++;   // shared by every program of this fragment shader
 			}
 #endif
 #ifndef SAMPLERS_SPEEDHACK
@@ -1572,14 +2235,16 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 	// same-shader fast path: vprog/attribs/vstreams persist from the
 	// previous draw, jump straight to uniform upload.
 	if (vgl_fast_draw_mode) {
-		static GLuint _last_fast_prog = 0;
-		if (cur_program == _last_fast_prog) {
+		// An armed draw: one stream, the fixed layout (vgl_draw_fixed).
+		if (fixed_base)
+			return vgl_draw_fixed(p, fixed_base, index_type == SCE_GXM_INDEX_SOURCE_INDEX_16BIT);
+		if (cur_program == vgl_last_fast_prog) {
 			PHASE_BEGIN(UPLOAD_UNIF);
 			uploadUniforms();
 			PHASE_END(UPLOAD_UNIF);
 			return GL_TRUE;
 		}
-		_last_fast_prog = cur_program;
+		vgl_last_fast_prog = cur_program;
 	}
 
 	// Aligning attributes
@@ -1716,7 +2381,19 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 
 	// Uploading new vertex program
 	PHASE_BEGIN(PATCH_VPROG);
-	patchVertexProgram(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
+	{
+		const uint32_t _cfg = vgl_vprog_cfg_hash(attributes, streams, p->attr_num);
+		if (p->vprog && p->vprog_cfg_valid && p->vprog_cfg_hash == _cfg) {
+			vgl_patch_cached++;
+		} else {
+			patchVertexProgram(gxm_shader_patcher, p->vshader->id, attributes, p->attr_num, streams, p->attr_num, &p->vprog);
+			p->vprog_cfg_hash = _cfg; p->vprog_cfg_valid = p->vprog != NULL;
+		}
+	}
+	// The patch failed: no draw on a NULL program. The fast-draw memo already names
+	// this program, and would send its next draw straight to the uniforms with
+	// whatever vertex program GXM holds: forget it, so that draw patches (or fails) again.
+	if (!p->vprog) { vgl_patch_skipped++; vgl_last_fast_prog = 0; return GL_FALSE; }
 	VGL_SET_VPROG(p->vprog);
 	PHASE_END(PATCH_VPROG);
 
@@ -1769,6 +2446,7 @@ void _vglDrawObjects_CustomShadersIMPL(GLboolean implicit_wvp) {
 
 	// Check if a blend info rebuild is required
 	setupFragProgram();
+	if (!p->fprog) { vgl_patch_skipped++; return GL_FALSE; }   // the patch failed: no draw on a NULL program
 
 	// Setting up required vertex shader
 	VGL_SET_VPROG(p->vprog);
@@ -1894,22 +2572,28 @@ GLuint glCreateShader(GLenum shaderType) {
 	}
 #endif
 
-	// Looking for a free shader slot
+	// Looking for a free shader slot, starting after the last one handed out
+	// (thousands are created at boot; a scan from slot 1 each time is quadratic).
+	static GLuint shader_hint = 0;
 	GLuint i, res = 0;
-	for (i = 1; i <= MAX_CUSTOM_SHADERS; i++) {
+	for (GLuint n = 0; n < MAX_CUSTOM_SHADERS; n++) {
+		i = (shader_hint + n) % MAX_CUSTOM_SHADERS + 1;
 		if (!(shaders[i - 1].valid)) {
 			res = i;
+			shader_hint = i;
 			break;
 		}
 	}
 
-#ifndef SKIP_ERROR_HANDLING
-	// All shader slots are busy, exiting call
+	// All shader slots are busy, exiting call. Unconditional: with the check
+	// compiled out, shaders[res - 1] with res 0 wrote shaders[-1] -- the tail of
+	// progs[], which sits directly before this array.
 	if (res == 0) {
+#ifndef SKIP_ERROR_HANDLING
 		vgl_log("%s:%d %s: Out of shaders handles. Consider increasing MAX_CUSTOM_SHADERS...\n", __FILE__, __LINE__, __func__);
+#endif
 		return res;
 	}
-#endif
 
 	// Reserving and initializing shader slot
 	switch (shaderType) {
@@ -2172,10 +2856,14 @@ void glGetAttachedShaders(GLuint prog, GLsizei maxCount, GLsizei *count, GLuint 
 
 GLuint glCreateProgram(void) {
 	// Looking for a free program slot
+	// Start after the last slot handed out: ~9k programs are created at boot.
+	static GLuint prog_hint = 0;
 	GLuint i, j, res = 0xFFFFFFFF;
-	for (i = 1; i <= MAX_CUSTOM_PROGRAMS; i++) {
+	for (GLuint n = 0; n < MAX_CUSTOM_PROGRAMS; n++) {
+		i = (prog_hint + n) % MAX_CUSTOM_PROGRAMS + 1;
 		// Program slot found, reserving and initializing it
 		if (!(progs[i - 1].status)) {
+			prog_hint = i;
 			res = i--;
 			progs[i].status = PROG_UNLINKED;
 			progs[i].attr_num = 0;
@@ -2220,6 +2908,25 @@ GLuint glCreateProgram(void) {
 			progs[i].is_fbo_float = 0xFF;
 			for (j = 0; j < VERTEX_ATTRIBS_NUM; j++) {
 				progs[i].attr[j].regIndex = 0xDEAD;
+			}
+			// Open Nectar fast path: no fixed vertex program, no cached fragment
+			// programs, no uniform copy to reuse.
+			progs[i].vprog_fixed = NULL;
+			progs[i].vprog_fixed_gen = 0;
+			progs[i].vprog_fixed_verdict = VGL_FIXED_OFF;
+			for (j = 0; j < 4; j++) {
+				progs[i].fcache[j].raw = 0;
+				progs[i].fcache[j].fbo_float = GL_FALSE;
+				progs[i].fcache[j].fp = NULL;
+			}
+			progs[i].fcache_next = 0;
+			for (j = 0; j < 2; j++) {
+				progs[i].unif_ver[j] = 1;
+				progs[i].gpu_ver[j] = 0;
+				progs[i].gpu_frame[j] = 0;
+				progs[i].gpu_gen[j] = 0;
+				progs[i].gpu_buf[j] = NULL;
+				progs[i].gpu_shadow[j] = GL_FALSE;
 			}
 			break;
 		}
@@ -2426,6 +3133,7 @@ void glGetProgramiv(GLuint progr, GLenum pname, GLint *params) {
 void glLinkProgram(GLuint progr) {
 	// Grabbing passed program
 	program *p = &progs[progr - 1];
+	p->vprog_cfg_valid = GL_FALSE;   // a relink patches afresh
 #ifndef SKIP_ERROR_HANDLING
 	if (glsl_sema_mode == VGL_MODE_POSTPONED) {
 		if (!(p->fshader->prog || (p->fshader->is_glsl && p->fshader->source)) || !(p->vshader->prog || (p->vshader->is_glsl && p->vshader->source))) {
@@ -2574,6 +3282,7 @@ void glLinkProgram(GLuint progr) {
 			u->ptr = param;
 			u->is_vertex = GL_FALSE;
 			u->is_fragment = GL_TRUE;
+			u->raw_int = GL_FALSE;
 			u->size = sceGxmProgramParameterGetComponentCount(param) * sceGxmProgramParameterGetArraySize(param);
 			u->data = (float *)vglMalloc(u->size * sizeof(float));
 #ifdef UNIFORM_VALUE_CACHE
@@ -2637,6 +3346,7 @@ void glLinkProgram(GLuint progr) {
 		}
 		ptr += 4;
 	}
+	vgl_log("[VGL UNIF] prog %d: VERT %d uniforms buf %u B | FRAG %d uniforms buf %u B\n", (int)progr, (int)p->vert_uniforms_num, (unsigned)p->vshader->unif_buf_size, (int)p->frag_uniforms_num, (unsigned)p->fshader->unif_buf_size);
 	p->vert_uniforms = (uniform *)vglMalloc(sizeof(uniform) * p->vert_uniforms_num);
 	j = 0;
 	ptr = _ptr;
@@ -2659,6 +3369,7 @@ void glLinkProgram(GLuint progr) {
 			uniform *u = &p->vert_uniforms[j++];
 			u->ptr = param;
 			u->is_vertex = GL_TRUE;
+			u->raw_int = GL_FALSE;
 			u->size = sceGxmProgramParameterGetComponentCount(param) * sceGxmProgramParameterGetArraySize(param);
 			u->data = getUniformAliasDataPtr(p->frag_uniforms, p->frag_uniforms_num, sceGxmProgramParameterGetName(param), u->size);
 			if (u->data) {
@@ -2678,6 +3389,13 @@ void glLinkProgram(GLuint progr) {
 		}
 		ptr += 4;
 	}
+
+	// Every entry, samplers included, names its program: a glUniform* on it bumps
+	// that program's uniform versions (VGL_UNIF_BUMP, vglSetUniformVersioning).
+	for (i = 0; i < p->frag_uniforms_num; i++)
+		p->frag_uniforms[i].owner = progr;
+	for (i = 0; i < p->vert_uniforms_num; i++)
+		p->vert_uniforms[i].owner = progr;
 
 #ifdef ENABLE_LEGACY_PIPELINE
 	// Creating fragment and vertex program via sceGxmShaderPatcher if using vgl* draw pipeline
@@ -2834,6 +3552,8 @@ inline void glUniform1i(GLint location, GLint v0) {
 	// Setting passed value to desired uniform
 	if (u->size == 0 || u->size == 0xFFFFFFFF) // Sampler
 		u->data = (float *)v0;
+	else if (u->raw_int) // Regular Uniform, S32/U32 in the shadow image
+		((int32_t *)u->data)[offs] = v0;
 	else // Regular Uniform
 		u->data[offs] = (float)v0;
 
@@ -2841,6 +3561,7 @@ inline void glUniform1i(GLint location, GLint v0) {
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform1i(GLuint prog, GLint location, GLint v0) {
@@ -2866,7 +3587,10 @@ inline void glUniform1iv(GLint location, GLsizei count, const GLint *value) {
 		}
 #endif
 		for (int i = 0; i < count; i++) {
-			u->data[offs + i] = (float)value[i];
+			if (u->raw_int)
+				((int32_t *)u->data)[offs + i] = value[i];
+			else
+				u->data[offs + i] = (float)value[i];
 		}
 	}
 
@@ -2874,6 +3598,7 @@ inline void glUniform1iv(GLint location, GLsizei count, const GLint *value) {
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform1iv(GLuint prog, GLint location, GLsizei count, const GLint *value) {
@@ -2896,6 +3621,7 @@ inline void glUniform1f(GLint location, GLfloat v0) {
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform1f(GLuint prog, GLint location, GLfloat v0) {
@@ -2923,6 +3649,7 @@ inline void glUniform1fv(GLint location, GLsizei count, const GLfloat *value) {
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform1fv(GLuint prog, GLint location, GLsizei count, const GLfloat *value) {
@@ -2939,13 +3666,19 @@ inline void glUniform2i(GLint location, GLint v0, GLint v1) {
 	uniform *u = (uniform *)getUniformFromPtr(location, &offs);
 
 	// Setting passed value to desired uniform
-	u->data[offs * 2] = (float)v0;
-	u->data[offs * 2 + 1] = (float)v1;
+	if (u->raw_int) {
+		((int32_t *)u->data)[offs * 2] = v0;
+		((int32_t *)u->data)[offs * 2 + 1] = v1;
+	} else {
+		u->data[offs * 2] = (float)v0;
+		u->data[offs * 2 + 1] = (float)v1;
+	}
 
 	if (u->is_vertex)
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform2i(GLuint prog, GLint location, GLint v0, GLint v1) {
@@ -2968,13 +3701,17 @@ inline void glUniform2iv(GLint location, GLsizei count, const GLint *value) {
 	}
 #endif
 	for (int i = 0; i < count * 2; i++) {
-		u->data[offs * 2 + i] = (float)value[i];
+		if (u->raw_int)
+			((int32_t *)u->data)[offs * 2 + i] = value[i];
+		else
+			u->data[offs * 2 + i] = (float)value[i];
 	}
 
 	if (u->is_vertex)
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform2iv(GLuint prog, GLint location, GLsizei count, const GLint *value) {
@@ -2998,6 +3735,7 @@ inline void glUniform2f(GLint location, GLfloat v0, GLfloat v1) {
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform2f(GLuint prog, GLint location, GLfloat v0, GLfloat v1) {
@@ -3025,6 +3763,7 @@ inline void glUniform2fv(GLint location, GLsizei count, const GLfloat *value) {
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform2fv(GLuint prog, GLint location, GLsizei count, const GLfloat *value) {
@@ -3041,14 +3780,21 @@ inline void glUniform3i(GLint location, GLint v0, GLint v1, GLint v2) {
 	uniform *u = (uniform *)getUniformFromPtr(location, &offs);
 
 	// Setting passed value to desired uniform
-	u->data[offs * 3] = (float)v0;
-	u->data[offs * 3 + 1] = (float)v1;
-	u->data[offs * 3 + 2] = (float)v2;
+	if (u->raw_int) {
+		((int32_t *)u->data)[offs * 3] = v0;
+		((int32_t *)u->data)[offs * 3 + 1] = v1;
+		((int32_t *)u->data)[offs * 3 + 2] = v2;
+	} else {
+		u->data[offs * 3] = (float)v0;
+		u->data[offs * 3 + 1] = (float)v1;
+		u->data[offs * 3 + 2] = (float)v2;
+	}
 
 	if (u->is_vertex)
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform3i(GLuint prog, GLint location, GLint v0, GLint v1, GLint v2) {
@@ -3071,13 +3817,17 @@ inline void glUniform3iv(GLint location, GLsizei count, const GLint *value) {
 	}
 #endif
 	for (int i = 0; i < count * 3; i++) {
-		u->data[offs * 3 + i] = (float)value[i];
+		if (u->raw_int)
+			((int32_t *)u->data)[offs * 3 + i] = value[i];
+		else
+			u->data[offs * 3 + i] = (float)value[i];
 	}
 
 	if (u->is_vertex)
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform3iv(GLuint prog, GLint location, GLsizei count, const GLint *value) {
@@ -3102,6 +3852,7 @@ inline void glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2) {
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform3f(GLuint prog, GLint location, GLfloat v0, GLfloat v1, GLfloat v2) {
@@ -3129,6 +3880,7 @@ inline void glUniform3fv(GLint location, GLsizei count, const GLfloat *value) {
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform3fv(GLuint prog, GLint location, GLsizei count, const GLfloat *value) {
@@ -3145,15 +3897,23 @@ inline void glUniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3) 
 	uniform *u = (uniform *)getUniformFromPtr(location, &offs);
 
 	// Setting passed value to desired uniform
-	u->data[offs * 4] = (float)v0;
-	u->data[offs * 4 + 1] = (float)v1;
-	u->data[offs * 4 + 2] = (float)v2;
-	u->data[offs * 4 + 3] = (float)v3;
+	if (u->raw_int) {
+		((int32_t *)u->data)[offs * 4] = v0;
+		((int32_t *)u->data)[offs * 4 + 1] = v1;
+		((int32_t *)u->data)[offs * 4 + 2] = v2;
+		((int32_t *)u->data)[offs * 4 + 3] = v3;
+	} else {
+		u->data[offs * 4] = (float)v0;
+		u->data[offs * 4 + 1] = (float)v1;
+		u->data[offs * 4 + 2] = (float)v2;
+		u->data[offs * 4 + 3] = (float)v3;
+	}
 
 	if (u->is_vertex)
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform4i(GLuint prog, GLint location, GLint v0, GLint v1, GLint v2, GLint v3) {
@@ -3176,13 +3936,17 @@ inline void glUniform4iv(GLint location, GLsizei count, const GLint *value) {
 	}
 #endif
 	for (int i = 0; i < count * 4; i++) {
-		u->data[offs * 4 + i] = (float)value[i];
+		if (u->raw_int)
+			((int32_t *)u->data)[offs * 4 + i] = value[i];
+		else
+			u->data[offs * 4 + i] = (float)value[i];
 	}
 
 	if (u->is_vertex)
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform4iv(GLuint prog, GLint location, GLsizei count, const GLint *value) {
@@ -3208,6 +3972,7 @@ inline void glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfl
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform4f(GLuint prog, GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
@@ -3235,6 +4000,7 @@ inline void glUniform4fv(GLint location, GLsizei count, const GLfloat *value) {
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniform4fv(GLuint prog, GLint location, GLsizei count, const GLfloat *value) {
@@ -3267,6 +4033,7 @@ inline void glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpos
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniformMatrix2fv(GLuint prog, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
@@ -3299,6 +4066,7 @@ inline void glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpos
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniformMatrix3fv(GLuint prog, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
@@ -3332,6 +4100,7 @@ inline void glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpos
 		dirty_vert_unifs = GL_TRUE;
 	if (u->is_fragment)
 		dirty_frag_unifs = GL_TRUE;
+	VGL_UNIF_BUMP(u);
 }
 
 void glProgramUniformMatrix4fv(GLuint prog, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {

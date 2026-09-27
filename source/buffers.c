@@ -574,6 +574,17 @@ GLboolean glUnmapBuffer(GLenum target) {
 	return glUnmapNamedBuffer((GLuint)gpu_buf);
 }
 
+void *vglBufferPtrStamp(GLuint id) {
+	gpubuffer *gpu_buf = (gpubuffer *)id;
+	if (!gpu_buf || !gpu_buf->ptr)
+		return NULL;
+	// The same mark a vitaGL draw leaves on the buffers it reads (draw.c setup_elements_indices,
+	// custom_shaders.c): glNamedBufferData and glDeleteBuffers then hand the old storage to the
+	// garbage collector for FRAME_PURGE_FREQ frames instead of vgl_free'ing it under the GPU.
+	gpu_buf->last_frame = vgl_framecount;
+	return gpu_buf->ptr;
+}
+
 void glFlushMappedNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length) {
 #ifndef SKIP_ERROR_HANDLING
 	gpubuffer *gpu_buf = (gpubuffer *)buffer;

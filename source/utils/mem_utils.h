@@ -98,6 +98,7 @@ void vgl_mem_init(size_t size_ram, size_t size_cdram, size_t size_phycont, size_
 void vgl_mem_term(void);
 size_t vgl_mem_get_free_space(vglMemType type);
 size_t vgl_mem_get_total_space(vglMemType type);
+uint32_t vgl_mem_stats_walk_mask(void); // bit per vglMemType whose free-space query fell back to the full chunk walk
 
 size_t vgl_malloc_usable_size(void *ptr);
 void *vgl_malloc(size_t size, vglMemType type);
