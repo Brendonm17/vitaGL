@@ -181,6 +181,13 @@ done:
 	// only flips when in_use_framebuffer is the display, so a frame whose last
 	// operation is a copy must still name the display here.
 	in_use_framebuffer = saved_write;
+	// ...and the flags sceneReset keeps with it: the copy scene's sceneReset
+	// left them describing dst. A glScissor / glViewport before the next draw
+	// reads in_use_framebuffer->height whenever is_rendering_display is false,
+	// so a stale false with a NULL (display) target was a NULL dereference
+	// (Open Nectar: the 3D scissor set right after the blur's copy).
+	is_rendering_display = !saved_write;
+	is_fbo_float = saved_write ? saved_write->is_float : GL_FALSE;
 	vgl_efb_request_restart();
 	dirty_frag_unifs = GL_TRUE;
 	dirty_vert_unifs = GL_TRUE;
