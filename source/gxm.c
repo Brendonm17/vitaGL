@@ -1328,7 +1328,8 @@ int vgl_efb_display_depth_stored(void) {
 #endif
 }
 GLboolean needs_end_scene_get(void) { return needs_end_scene; }
-// A display scene ended for a copy resumes with the depth it stored (same as vglSceneSubmit).
+// A display scene interrupted by a copy resumes with the depth the last display
+// scene stored (same as vglSceneSubmit).
 void vgl_efb_arm_display_depth_reload(framebuffer *src_fb) {
 #if !defined(STORE_DEPTH_STENCIL) && !defined(DEPTH_STENCIL_HACK)
 	if (!src_fb && display_depth_persist) {
@@ -1337,6 +1338,35 @@ void vgl_efb_arm_display_depth_reload(framebuffer *src_fb) {
 	}
 #else
 	(void)src_fb;
+#endif
+}
+// The composite's and the display filter's scenes draw without depth: they
+// neither load nor store the display's, so memory keeps what the scene before
+// them stored, and the scene after them loads it (resume with reload).
+// Returns whether the display depth is being kept at all.
+GLboolean vgl_efb_display_depth_suspend(void) {
+#if !defined(STORE_DEPTH_STENCIL) && !defined(DEPTH_STENCIL_HACK)
+	if (!display_depth_persist)
+		return GL_FALSE;
+	if (display_depth_load_pending) {
+		display_depth_load_pending = GL_FALSE;
+		sceGxmDepthStencilSurfaceSetForceLoadMode(&gxm_depth_stencil_surface, SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_DISABLED);
+	}
+	sceGxmDepthStencilSurfaceSetForceStoreMode(&gxm_depth_stencil_surface, SCE_GXM_DEPTH_STENCIL_FORCE_STORE_DISABLED);
+	return GL_TRUE;
+#else
+	return GL_FALSE;
+#endif
+}
+void vgl_efb_display_depth_resume(GLboolean reload) {
+#if !defined(STORE_DEPTH_STENCIL) && !defined(DEPTH_STENCIL_HACK)
+	sceGxmDepthStencilSurfaceSetForceStoreMode(&gxm_depth_stencil_surface, SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED);
+	if (reload) {
+		sceGxmDepthStencilSurfaceSetForceLoadMode(&gxm_depth_stencil_surface, SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED);
+		display_depth_load_pending = GL_TRUE;
+	}
+#else
+	(void)reload;
 #endif
 }
 void vgl_efb_scene_end(void) {

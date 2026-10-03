@@ -33,6 +33,8 @@ GLboolean needs_end_scene_get(void);
 void vgl_efb_arm_display_depth_reload(framebuffer *src_fb);
 void vgl_efb_scene_end(void);
 void vgl_efb_request_restart(void);
+GLboolean vgl_efb_display_depth_suspend(void);
+void vgl_efb_display_depth_resume(GLboolean reload);
 
 int vglEfbCopySetPrograms(const SceGxmProgram *vp, const SceGxmProgram *const *fps, int nfp) {
 	if (!vp || !fps || nfp <= 0 || nfp > EFBCOPY_MAX_FP)
@@ -124,10 +126,12 @@ int vglEfbCopy(GLuint dst_fbo, int fp_index, int src_depth, float u0, float v0, 
 	// End the scene that owns the source so its fragment job (and, for the
 	// display, the depth store) is submitted before the copy scene.
 	framebuffer *saved_write = active_write_fb;
-	if (needs_end_scene_get()) {
-		vgl_efb_arm_display_depth_reload(src_fb);
+	// The display resumes with the depth its last scene stored -- also when
+	// that scene is already closed (a composite or another copy ended it):
+	// otherwise everything drawn after this copy tests against cleared depth.
+	vgl_efb_arm_display_depth_reload(src_fb);
+	if (needs_end_scene_get())
 		vgl_efb_scene_end();
-	}
 
 	// The copy scene on the destination.
 	active_write_fb = dst;
@@ -205,7 +209,9 @@ int vglEfbFilterDisplay(GLuint tmp_fbo, int fp_copy, int fp_filter, float row_dv
 	int r = vglEfbCopy(tmp_fbo, fp_copy, 0, 0.0f, 0.0f, 1.0f, 1.0f, 0);
 	if (r < 0)
 		return r;
-	// The display again (the same back buffer), drawn over entirely.
+	// The display again (the same back buffer), drawn over entirely, without
+	// depth: the frame's last scene neither loads nor stores it.
+	const GLboolean depth_kept = vgl_efb_display_depth_suspend();
 	sceneReset();
 	const float w = (float)DISPLAY_WIDTH, h = (float)DISPLAY_HEIGHT;
 	sceGxmSetViewport(gxm_context, w * 0.5f, w * 0.5f, h * 0.5f, -h * 0.5f, 0.5f, 0.5f);
@@ -247,6 +253,8 @@ int vglEfbFilterDisplay(GLuint tmp_fbo, int fp_copy, int fp_filter, float row_dv
 		sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, idx, 4);
 	}
 	vgl_efb_scene_end();
+	if (depth_kept)
+		vgl_efb_display_depth_resume(GL_FALSE);
 	vgl_efb_request_restart();
 	dirty_frag_unifs = GL_TRUE;
 	dirty_vert_unifs = GL_TRUE;
@@ -346,10 +354,12 @@ int vglEfbComposite(int fp_index, GLuint tex0, GLuint tex1, float p0, float p1) 
 		return -2;
 	if (tex1 >= TEXTURES_NUM || (tex1 && texture_slots[tex1].status != TEX_VALID))
 		return -2;
-	if (needs_end_scene_get()) {
-		vgl_efb_arm_display_depth_reload(NULL);
+	// The open scene stores the display depth (when it is kept) as it ends; the
+	// composite's own scene draws without depth and neither loads nor stores
+	// it, and the scene after it loads what was stored.
+	if (needs_end_scene_get())
 		vgl_efb_scene_end();
-	}
+	const GLboolean depth_kept = vgl_efb_display_depth_suspend();
 	sceneReset();
 	const float w = (float)DISPLAY_WIDTH, h = (float)DISPLAY_HEIGHT;
 	sceGxmSetViewport(gxm_context, w * 0.5f, w * 0.5f, h * 0.5f, -h * 0.5f, 0.5f, 0.5f);
@@ -399,6 +409,8 @@ int vglEfbComposite(int fp_index, GLuint tex0, GLuint tex1, float p0, float p1) 
 		sceGxmDraw(gxm_context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, idx, 4);
 	}
 	vgl_efb_scene_end();
+	if (depth_kept)
+		vgl_efb_display_depth_resume(GL_TRUE);
 	vgl_efb_request_restart();
 	dirty_frag_unifs = GL_TRUE;
 	dirty_vert_unifs = GL_TRUE;
