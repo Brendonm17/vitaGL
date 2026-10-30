@@ -231,6 +231,10 @@ GLboolean vglInitWithCustomSizes(int pool_size, int width, int height, int ram_p
 	// Initializing sceGxm
 	initGxm();
 
+	// Only this thread may run the forced-collection allocator fallback (gpu_utils.c)
+	extern SceUID vgl_alloc_thread;
+	vgl_alloc_thread = sceKernelGetThreadId();
+
 	// Initializing memory heaps for CDRAM and RAM memory (both standard and physically contiguous)
 	vgl_mem_init(ram_pool_size, cdram_pool_size, phycont_pool_size, cdlg_pool_size);
 

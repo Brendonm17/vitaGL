@@ -85,6 +85,8 @@ void dxt_compress(uint8_t *dst, uint8_t *src, int w, int h, int isdxt5) {
 }
 
 static int unsafe_allocator_counter = 0;
+SceUID vgl_alloc_thread = -1; // the thread that inited vitaGL: the only one that may finish the GPU and force a collection
+volatile uint32_t vgl_alloc_unsafe_count = 0; // forced collections and refused off-thread fallbacks, for the app's logs
 void *gpu_alloc_mapped_aligned_unsafe(size_t alignment, size_t size, vglMemType type) {
 	// Performing a garbage collection cycle prior to attempting to allocate the memory again
 	unsafe_allocator_counter++;
@@ -94,7 +96,14 @@ void *gpu_alloc_mapped_aligned_unsafe(size_t alignment, size_t size, vglMemType 
 #else
 	sceKernelWaitSema(gc_mutex[1], 1, NULL);
 	sceKernelSignalSema(gc_mutex[0], 1);
-	sceKernelDelayThread(1000000);
+	// Waiting for the queued collections to finish (the pull semaphore back at its max) rather than a blind 1 s sleep
+	for (int waited = 0; waited < 1000; waited++) {
+		SceKernelSemaInfo info;
+		info.size = sizeof(SceKernelSemaInfo);
+		if (sceKernelGetSemaInfo(gc_mutex[1], &info) < 0 || info.currentCount >= FRAME_PURGE_FREQ)
+			break;
+		sceKernelDelayThread(100);
+	}
 #endif
 
 	// Allocating requested memblock
@@ -195,6 +204,10 @@ void *gpu_alloc_mapped_aligned(size_t alignment, size_t size, vglMemType type) {
 #endif
 
 	if (!res) {
+		vgl_alloc_unsafe_count++;
+		// Off the init thread a GPU finish races the renderer: those callers get NULL and retry later
+		if (vgl_alloc_thread >= 0 && sceKernelGetThreadId() != vgl_alloc_thread)
+			return NULL;
 		// Attempt to force garbage collector in order to try to free some mem in an unsafe way
 #ifdef LOG_ERRORS
 		vgl_log("%s:%d gpu_alloc_mapped_aligned failed with a requested size of %u bytes, attempting to forcefully free required memory.\n", __FILE__, __LINE__, size);
